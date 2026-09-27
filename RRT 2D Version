@@ -1,0 +1,336 @@
+RRT 2D Version
+
+%% RRT_manipulator_2D.m
+% RRT motion planning for a 2-DOF (2-link) planar robot manipulator.
+% The tree is grown in CONFIGURATION SPACE (theta1, theta2), and every
+% candidate configuration is collision-checked in WORKSPACE against
+% circular obstacles using the manipulator's forward kinematics.
+%
+% This follows the classic RRT pseudocode:
+%   1. Initialize tree with q_init as the root
+%   2. For k = 1..K:
+%       a. sample q_rand
+%       b. find nearest node q_near
+%       c/d. steer from q_near toward q_rand by a fixed step -> q_new
+%       e/f. if collision-free, add q_new as a vertex + edge
+%   3. Return the tree (and the path to the goal, if found)
+%
+% No toolboxes required - pure base MATLAB.
+
+clear; clc; close all;
+rng(1);   % remove or change seed for different random runs
+
+%% ------------------------- Robot parameters -------------------------
+L1 = 1.0;   % length of link 1
+L2 = 1.0;   % length of link 2
+
+%% ------------------------- Configuration space ------------------------
+qmin = [-pi, -pi];
+qmax = [ pi,  pi];
+
+%% ------------------------- Start / goal --------------------------------
+q_start = [-pi/2,  0];      % joint angles (radians)
+q_goal  = [ pi/6,  pi/12];  % joint angles (radians)
+
+%% ------------------------- Obstacles (workspace) -----------------------
+% IMPORTANT: for a 2-link arm, if an obstacle is close enough that LINK 1
+% alone can reach it (distance_from_base - radius < L1), then link 1's
+% collision (which does not depend on theta2 at all) blocks EVERY theta2
+% for that theta1 -- creating a full-width wall across configuration
+% space. If that wall sits between q_start and q_goal's theta1, the goal
+% becomes mathematically unreachable, no matter how RRT is tuned.
+% Rule of thumb: keep distance_from_base - radius > L1 for every obstacle.
+% Each row: [x_center, y_center, radius]
+obstacles = [ 1.04   1.04   0.25;
+             -0.65   1.30   0.20;
+              1.30  -0.65   0.20];
+
+%% ------------------------- RRT parameters -------------------------------
+K               = 3000;   % max iterations
+stepSize        = 0.20;   % steer step size in configuration space (rad)
+maxExtendSteps  = 25;     % max consecutive hops per iteration (greedy extend)
+goalBias        = 0.08;   % probability of sampling the goal directly
+goalTol         = 0.10;   % distance (rad) to goal that counts as "reached"
+edgeCheckRes    = 5;      % samples used to collision-check EACH short sub-edge
+
+%% ------------------------- Sanity checks ---------------------------------
+% Instead of failing blindly, SHOW the offending pose so you can see why
+% it collides and adjust q_start / q_goal / obstacles accordingly.
+startBad = isCollision(q_start, L1, L2, obstacles);
+goalBad  = isCollision(q_goal,  L1, L2, obstacles);
+
+if startBad || goalBad
+    figure('Name', 'Collision Preview', 'Position', [50 80 480 480]);
+    axis equal; hold on; grid on;
+    xlim([-2.2 2.2]); ylim([-2.2 2.2]);
+    plotObstacles(obstacles);
+    if startBad
+        plotManipulator(q_start, L1, L2, 'r');
+        text(0, -1.9, 'START (red) is in collision', ...
+             'HorizontalAlignment', 'center', 'Color', 'r');
+    end
+    if goalBad
+        plotManipulator(q_goal, L1, L2, 'm');
+        text(0, -2.05, 'GOAL (magenta) is in collision', ...
+             'HorizontalAlignment', 'center', 'Color', 'm');
+    end
+    title('Fix q\_start / q\_goal / obstacles, then re-run');
+    drawnow;
+end
+
+if startBad
+    error('Start configuration is in collision with an obstacle. See the Collision Preview figure.');
+end
+if goalBad
+    error('Goal configuration is in collision with an obstacle. See the Collision Preview figure.');
+end
+
+%% ------------------------- 1. Initialize tree -----------------------------
+tree.nodes  = q_start;   % Nx2 matrix of configurations
+tree.parent = 0;         % parent index of each node (0 = root)
+
+goalReached = false;
+goalIdx     = -1;
+bestDistToGoal = norm(q_start - q_goal);   % diagnostic: closest approach so far
+
+fprintf('Building RRT ...\n');
+for k = 1:K
+
+    % --- a. Pick a random state x_rand -------------------------------
+    if rand < goalBias
+        q_rand = q_goal;                       % goal-biased sampling
+    else
+        q_rand = qmin + rand(1,2) .* (qmax - qmin);
+    end
+
+    % --- b. Find nearest vertex x_near -------------------------------
+    diffs = tree.nodes - q_rand;
+    dists = sum(diffs.^2, 2);
+    [~, idxNear] = min(dists);
+    q_near = tree.nodes(idxNear, :);
+
+    % --- c/d/e/f. GREEDY EXTEND: keep stepping toward x_rand -----------
+    % Instead of taking only one stepSize hop per iteration, keep hopping
+    % in the same direction (adding each valid intermediate node) until
+    % we either reach q_rand, hit an obstacle, or hit maxExtendSteps.
+    % This lets one lucky sample push a long branch across open space in
+    % a single outer iteration, instead of needing many separate lucky
+    % samples to cover the same distance.
+    direction = q_rand - q_near;
+    dist = norm(direction);
+    if dist > 1e-9
+        unitDir = direction / dist;
+    else
+        unitDir = [0 0];
+    end
+
+    q_current   = q_near;
+    idxCurrent  = idxNear;
+    numSubSteps = min(maxExtendSteps, ceil(dist / stepSize));
+
+    for s = 1:numSubSteps
+        remaining = norm(q_rand - q_current);
+        thisStep  = min(stepSize, remaining);
+        q_candidate = q_current + unitDir * thisStep;
+        q_candidate = max(min(q_candidate, qmax), qmin);   % clip to joint limits
+
+        if isEdgeCollision(q_current, q_candidate, L1, L2, obstacles, edgeCheckRes)
+            break;   % this branch is blocked; stop extending it
+        end
+
+        tree.nodes  = [tree.nodes;  q_candidate];
+        tree.parent = [tree.parent; idxCurrent];
+        idxCurrent  = size(tree.nodes, 1);
+        q_current   = q_candidate;
+
+        dToGoal = norm(q_current - q_goal);
+        if dToGoal < bestDistToGoal
+            bestDistToGoal = dToGoal;
+        end
+
+        if dToGoal < goalTol
+            goalReached = true;
+            goalIdx = idxCurrent;
+            fprintf('Goal reached at iteration %d (tree has %d nodes)\n', ...
+                     k, size(tree.nodes,1));
+            break;
+        end
+    end
+
+    if goalReached
+        break;
+    end
+
+    % --- diagnostic: report progress every 500 iterations -------------
+    if mod(k, 500) == 0
+        th1min = min(tree.nodes(:,1));
+        th1max = max(tree.nodes(:,1));
+        fprintf(['  iter %4d | tree size %4d | closest approach to goal: %.4f rad ', ...
+                  '| theta1 range: [%.3f, %.3f]\n'], ...
+                 k, size(tree.nodes,1), bestDistToGoal, th1min, th1max);
+    end
+end
+
+if ~goalReached
+    fprintf(['Goal NOT reached within %d iterations.\n', ...
+             '  Closest the tree ever got to the goal: %.4f rad ', ...
+             '(goalTol = %.4f)\n'], K, bestDistToGoal, goalTol);
+    if bestDistToGoal < 3*goalTol
+        fprintf(['  -> The tree got CLOSE but couldn''t close the gap. ', ...
+                 'This usually means a narrow passage near an obstacle:\n', ...
+                 '     try a smaller stepSize (finer steering), a larger goalTol,\n', ...
+                 '     or a higher goalBias.\n']);
+    else
+        fprintf(['  -> The tree never got close. Try increasing K, increasing\n', ...
+                 '     goalBias, or increasing stepSize for faster exploration.\n']);
+    end
+end
+
+%% ------------------------- Extract path (backtrack) ------------------------
+path = [];
+if goalReached
+    idx = goalIdx;
+    while idx ~= 0
+        path = [tree.nodes(idx, :); path]; %#ok<AGROW>
+        idx  = tree.parent(idx);
+    end
+    fprintf('Path found with %d waypoints.\n', size(path,1));
+end
+
+%% ------------------------- Plot: configuration space -----------------------
+figure('Name', 'RRT - Configuration Space', 'Position', [50 80 480 480]);
+hold on; axis equal; grid on;
+plotTree(tree);
+plot(q_start(1), q_start(2), 'go', 'MarkerFaceColor', 'g', 'MarkerSize', 9);
+plot(q_goal(1),  q_goal(2),  'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 9);
+if goalReached
+    plot(path(:,1), path(:,2), 'b-', 'LineWidth', 2);
+end
+xlabel('\theta_1 (rad)'); ylabel('\theta_2 (rad)');
+title('RRT Tree in Configuration Space');
+legend('Tree edges', 'Start', 'Goal', 'Path', 'Location', 'best');
+
+%% ------------------------- Plot + animate: workspace ------------------------
+figure('Name', 'RRT - Workspace', 'Position', [560 80 480 480]);
+axis equal; hold on; grid on;
+xlim([-2.2 2.2]); ylim([-2.2 2.2]);
+plotObstacles(obstacles);
+title('Workspace: Manipulator Path');
+xlabel('x'); ylabel('y');
+
+if goalReached
+    animateManipulator(path, L1, L2, obstacles);
+else
+    plotManipulator(q_start, L1, L2, 'k');
+end
+
+
+%% ============================================================
+%                       LOCAL FUNCTIONS
+% ============================================================
+
+function [p0, p1, p2] = forwardKinematics(q, L1, L2)
+% Forward kinematics of a 2-link planar arm, base fixed at origin.
+    p0 = [0, 0];
+    p1 = p0 + [L1*cos(q(1)), L1*sin(q(1))];
+    p2 = p1 + [L2*cos(q(1)+q(2)), L2*sin(q(1)+q(2))];
+end
+
+function d = pointToSegmentDistance(p, a, b)
+% Shortest distance from point p to segment [a,b].
+    ab = b - a;
+    denom = dot(ab, ab);
+    if denom < 1e-12
+        t = 0;
+    else
+        t = dot(p - a, ab) / denom;
+        t = max(0, min(1, t));
+    end
+    proj = a + t * ab;
+    d = norm(p - proj);
+end
+
+function tf = isCollision(q, L1, L2, obstacles)
+% True if either link of the manipulator at configuration q intersects
+% any circular obstacle.
+    [p0, p1, p2] = forwardKinematics(q, L1, L2);
+    tf = false;
+    for i = 1:size(obstacles, 1)
+        c = obstacles(i, 1:2);
+        r = obstacles(i, 3);
+        if pointToSegmentDistance(c, p0, p1) <= r || ...
+           pointToSegmentDistance(c, p1, p2) <= r
+            tf = true;
+            return;
+        end
+    end
+end
+
+function tf = isEdgeCollision(qA, qB, L1, L2, obstacles, res)
+% Collision-check the straight-line motion in configuration space from
+% qA to qB by sampling 'res' intermediate configurations.
+    tf = false;
+    for i = 0:res
+        t = i / res;
+        q = qA + t * (qB - qA);
+        if isCollision(q, L1, L2, obstacles)
+            tf = true;
+            return;
+        end
+    end
+end
+
+function plotTree(tree)
+% Draw every edge of the RRT tree (configuration space).
+    for i = 2:size(tree.nodes, 1)
+        p = tree.nodes(tree.parent(i), :);
+        c = tree.nodes(i, :);
+        plot([p(1) c(1)], [p(2) c(2)], '-', 'Color', [0.75 0.75 0.75]);
+    end
+end
+
+function plotObstacles(obstacles)
+% Draw filled circular obstacles in the workspace.
+    for i = 1:size(obstacles, 1)
+        x = obstacles(i,1); y = obstacles(i,2); r = obstacles(i,3);
+        rectangle('Position', [x-r, y-r, 2*r, 2*r], ...
+                  'Curvature', [1 1], 'FaceColor', [1 0.6 0.6], ...
+                  'EdgeColor', 'r');
+    end
+end
+
+function h = plotManipulator(q, L1, L2, color)
+% Draw the manipulator (two links) at configuration q. Returns line handles.
+    [p0, p1, p2] = forwardKinematics(q, L1, L2);
+    h1 = plot([p0(1) p1(1)], [p0(2) p1(2)], '-o', 'Color', color, ...
+              'LineWidth', 3, 'MarkerFaceColor', color);
+    h2 = plot([p1(1) p2(1)], [p1(2) p2(2)], '-o', 'Color', color, ...
+              'LineWidth', 3, 'MarkerFaceColor', color);
+    h = [h1 h2];
+end
+
+function animateManipulator(path, L1, L2, obstacles)
+% Animate the manipulator moving along the RRT path (with light
+% interpolation between waypoints for a smoother animation), replotting
+% obstacles each frame.
+    stepsPerSegment = 5;
+    qTraj = path(1, :);
+    for i = 1:size(path,1)-1
+        for t = linspace(0, 1, stepsPerSegment)
+            qTraj = [qTraj; path(i,:) + t*(path(i+1,:) - path(i,:))]; %#ok<AGROW>
+        end
+    end
+
+    for i = 1:size(qTraj, 1)
+        cla;
+        plotObstacles(obstacles);
+        plotManipulator(qTraj(i,:), L1, L2, 'b');
+        [~, ~, pEE] = forwardKinematics(qTraj(i,:), L1, L2);
+        plot(pEE(1), pEE(2), 'k.', 'MarkerSize', 8);  % trace end-effector
+        xlim([-2.2 2.2]); ylim([-2.2 2.2]);
+        axis equal; grid on;
+        title('Workspace: Manipulator Path');
+        drawnow;
+        pause(0.03);
+    end
+end
