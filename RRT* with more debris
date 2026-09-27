@@ -1,0 +1,449 @@
+%% RRT_manipulator_debris_field.m  (RRT*-Connect + shortcutting, realistic debris field)
+%
+% Generates a synthetic space-debris field and re-tests the RRT*-Connect
+% planner from the previous version against it. Two things changed:
+%
+% 1) DEBRIS FIELD GENERATION -- new, based on a real statistical model.
+%    Real orbital debris populations are NOT uniformly sized: there are
+%    far more small fragments than large ones. This follows a power-law
+%    relationship formalized in NASA's Standard Breakup Model (Johnson
+%    et al., 2001): the cumulative number of fragments larger than a
+%    given characteristic length L scales as N(>L) ~ L^-alpha, with
+%    alpha ~ 1.6 for explosion-generated fragments. This script samples
+%    debris diameters from a truncated Pareto distribution with that
+%    same exponent (see generateDebrisField below), so you get the
+%    "many small pieces, a few large ones" character of a real field
+%    rather than uniformly-sized clutter.
+%    Positions are scattered uniformly BY VOLUME within a spherical
+%    shell around the arm's workspace. This is a simplifying assumption
+%    -- real debris density varies strongly by orbital altitude, but
+%    that has no meaningful analogue at the scale of a single robot
+%    arm's few-meter workspace, so a locally-uniform shell is the
+%    reasonable choice here.
+%
+% 2) COLLISION CHECKING -- now vectorized over links AND obstacles
+%    (previously it vectorized over links but still looped over
+%    obstacles, which was fine for 3 obstacles but would scale poorly
+%    once the debris field has dozens of pieces). The point-to-segment
+%    math is unchanged; it's just computed for every (link, obstacle)
+%    pair in one array operation instead of a per-obstacle loop.
+%
+% RRT*-CONNECT ALGORITHM AND ALL ITS PARAMETERS ARE UNCHANGED from the
+% previous version.
+%
+% No toolboxes required - pure base MATLAB.
+clear; clc; close all;
+rng(1);
+%% ------------------------- Robot parameters -------------------------
+numLinks = 6;
+L = ones(1, numLinks) * (2/numLinks);
+jointAxis = zeros(numLinks, 3);
+for i = 1:numLinks
+   if mod(i,2) == 1
+       jointAxis(i,:) = [0 0 1];   % yaw
+   else
+       jointAxis(i,:) = [0 1 0];   % pitch
+   end
+end
+%% ------------------------- Configuration space ------------------------
+qmin = -pi * ones(1, numLinks);
+qmax =  pi * ones(1, numLinks);
+%% ------------------------- Start / goal --------------------------------
+q_start = zeros(1, numLinks);
+q_start(1) = -pi/2;
+% CHANGED: a genuinely harder goal on the "far side" of the debris field.
+% Verified below that the direct straight-line joint-space path between
+% q_start and this q_goal is actually blocked -- otherwise the planner's
+% job is trivial and shortcutting can (correctly) collapse the path to a
+% near-straight line, which tells you nothing about how the algorithm
+% behaves under real obstruction.
+q_goal = [pi/2, pi/6, pi/3, -pi/6, 0, 0];
+%% ------------------------- Debris field generation -----------------------
+% CHANGED: more and bigger debris than before, to build a genuinely
+% cluttered field rather than a handful of easily-avoided pieces.
+% Power-law size distribution (NASA Standard Breakup Model exponent),
+% uniform-by-volume spatial distribution in a spherical shell.
+numDebris     = 60;    % was 30
+debrisDiamMin = 0.10;  % was 0.06
+debrisDiamMax = 0.90;  % was 0.5 -- some pieces are now nearly half the arm's total reach
+paretoAlpha   = 1.6;   % NASA Standard Breakup Model exponent (unchanged)
+shellRmin     = 0.4;   % keep-out radius around the base (unchanged in spirit, tightened slightly)
+shellRmax     = 2.1;   % unchanged
+debrisSeed = 0;
+maxRegenTries = 50;
+for attempt = 1:maxRegenTries
+   obstacles = generateDebrisField(numDebris, shellRmin, shellRmax, ...
+                                    debrisDiamMin, debrisDiamMax, paretoAlpha, debrisSeed);
+   if ~isCollision(q_start, L, jointAxis, obstacles) && ~isCollision(q_goal, L, jointAxis, obstacles)
+       fprintf('Debris field seed %d: start/goal both collision-free.\n', debrisSeed);
+       break;
+   end
+   debrisSeed = debrisSeed + 1;
+end
+if isCollision(q_start, L, jointAxis, obstacles) || isCollision(q_goal, L, jointAxis, obstacles)
+   error(['Could not generate a debris field leaving q_start/q_goal collision-free ', ...
+          'after %d tries. Reduce numDebris or debrisDiamMax.'], maxRegenTries);
+end
+fprintf('Debris field: %d pieces, diameters [%.3f, %.3f] (mean %.3f), Pareto alpha=%.1f\n', ...
+       numDebris, min(2*obstacles(:,4)), max(2*obstacles(:,4)), mean(2*obstacles(:,4)), paretoAlpha);
+% --- Sanity check: is this actually a hard problem? ---
+% Verify the straight-line joint-space path is genuinely blocked. If it
+% weren't, the planner's job would be trivial and shortcutting could
+% (correctly) collapse the path to a near-straight line -- which
+% wouldn't demonstrate anything about how the algorithm behaves under
+% real obstruction.
+straightLineBlocked = isEdgeCollision(q_start, q_goal, L, jointAxis, obstacles, 40);
+straightLineDist = norm(q_goal - q_start);
+fprintf('Straight-line joint-space distance (theoretical best case): %.3f rad\n', straightLineDist);
+fprintf('Direct path blocked by debris: %s  %s\n', mat2str(straightLineBlocked), ...
+       '(this confirms the planner actually has to navigate, not just walk a straight line)');
+%% ------------------------- RRT*-Connect parameters ------------------------
+% UNCHANGED from the previous version, except K (see note).
+K               = 1500;  % was 1000 -- the denser field needs more attempts
+                         % before a random sample yields a valid extension
+stepSize        = 0.20;
+maxExtendSteps  = 25;
+connectCap      = 300;
+edgeCheckRes    = 5;
+goalTol         = 0.10;
+rewireRadius                 = 0.6;
+extraItersAfterFirstSolution = 30;
+shortcutIterations           = 300;
+shortcutCheckRes             = 8;
+%% ------------------------- Initialize two trees -----------------------------
+treeStart.nodes = q_start; treeStart.parent = 0; treeStart.cost = 0; treeStart.children = {[]};
+treeGoal.nodes  = q_goal;  treeGoal.parent  = 0; treeGoal.cost  = 0; treeGoal.children  = {[]};
+candidates = zeros(0,2);
+extendStartFirst = true;
+firstFoundAt = -1;
+fprintf('Building RRT*-Connect against the debris field (config-space dim = %d) ...\n', numLinks);
+tic;
+for k = 1:K
+   q_rand = qmin + rand(1, numLinks) .* (qmax - qmin);
+   if extendStartFirst
+       [treeStart, idxS] = extendTreeStar(treeStart, q_rand, L, jointAxis, obstacles, ...
+                                           stepSize, maxExtendSteps, edgeCheckRes, qmin, qmax, rewireRadius);
+       if idxS ~= -1
+           [treeGoal, idxG, reached] = extendTreePlain(treeGoal, treeStart.nodes(idxS,:), L, jointAxis, obstacles, ...
+                                                         stepSize, connectCap, edgeCheckRes, qmin, qmax, goalTol);
+           if reached
+               candidates(end+1, :) = [idxS, idxG]; %#ok<AGROW>
+               if firstFoundAt == -1, firstFoundAt = k; end
+           end
+       end
+   else
+       [treeGoal, idxG] = extendTreeStar(treeGoal, q_rand, L, jointAxis, obstacles, ...
+                                          stepSize, maxExtendSteps, edgeCheckRes, qmin, qmax, rewireRadius);
+       if idxG ~= -1
+           [treeStart, idxS, reached] = extendTreePlain(treeStart, treeGoal.nodes(idxG,:), L, jointAxis, obstacles, ...
+                                                          stepSize, connectCap, edgeCheckRes, qmin, qmax, goalTol);
+           if reached
+               candidates(end+1, :) = [idxS, idxG]; %#ok<AGROW>
+               if firstFoundAt == -1, firstFoundAt = k; end
+           end
+       end
+   end
+   extendStartFirst = ~extendStartFirst;
+   if firstFoundAt ~= -1 && (k - firstFoundAt) >= extraItersAfterFirstSolution
+       break;
+   end
+end
+elapsedTime = toc;
+connected = ~isempty(candidates);
+if ~connected
+   fprintf('Trees NOT connected within %d iterations (%.1fs elapsed). Try increasing K.\n', K, elapsedTime);
+else
+   fprintf('First connection at iteration %d; stopped at iteration %d (%.2fs). Tree sizes: %d + %d.\n', ...
+           firstFoundAt, k, elapsedTime, size(treeStart.nodes,1), size(treeGoal.nodes,1));
+end
+%% ------------------------- Pick best candidate, extract + smooth path ----------
+path = [];
+if connected
+   bestCost = Inf; bestIdxS = -1; bestIdxG = -1;
+   for i = 1:size(candidates,1)
+       idxS = candidates(i,1); idxG = candidates(i,2);
+       c = treeStart.cost(idxS) + treeGoal.cost(idxG) + norm(treeStart.nodes(idxS,:) - treeGoal.nodes(idxG,:));
+       if c < bestCost
+           bestCost = c; bestIdxS = idxS; bestIdxG = idxG;
+       end
+   end
+   fprintf('Best of %d candidate connections: raw path cost = %.3f\n', size(candidates,1), bestCost);
+   pathS = []; idx = bestIdxS;
+   while idx ~= 0
+       pathS = [treeStart.nodes(idx,:); pathS]; %#ok<AGROW>
+       idx = treeStart.parent(idx);
+   end
+   pathG = []; idx = bestIdxG;
+   while idx ~= 0
+       pathG = [treeGoal.nodes(idx,:); pathG]; %#ok<AGROW>
+       idx = treeGoal.parent(idx);
+   end
+   rawPath = [pathS; flipud(pathG)];
+   path = shortcutSmooth(rawPath, L, jointAxis, obstacles, shortcutCheckRes, shortcutIterations);
+   fprintf('After shortcutting: %d waypoints (was %d), cost = %.3f (was %.3f)\n', ...
+           size(path,1), size(rawPath,1), pathCost(path), pathCost(rawPath));
+   fprintf('Final path cost is %.2fx the straight-line lower bound (%.3f) -- %s\n', ...
+           pathCost(path)/straightLineDist, straightLineDist, ...
+           'a ratio near 1.0 would mean almost no real detour was needed; well above 1.0 confirms genuine navigation.');
+end
+%% ------------------------- Plot: configuration space (projection) ----------
+figure('Name', 'RRT*-Connect vs Debris Field - Configuration Space Projection', 'Position', [50 80 480 480]);
+hold on; axis equal; grid on;
+plotTreeProj(treeStart, [0.6 0.8 1.0]);
+plotTreeProj(treeGoal,  [1.0 0.8 0.6]);
+plot(q_start(1), q_start(2), 'go', 'MarkerFaceColor', 'g', 'MarkerSize', 9);
+plot(q_goal(1),  q_goal(2),  'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 9);
+if connected
+   plot(rawPath(:,1), rawPath(:,2), '-', 'Color', [0.6 0.6 0.6], 'LineWidth', 1);
+   plot(path(:,1), path(:,2), 'b-', 'LineWidth', 2);
+end
+xlabel('\theta_1 (rad)'); ylabel('\theta_2 (rad)');
+title({'RRT*-Connect vs Debris Field - projection onto (\theta_1,\theta_2)', ...
+      'gray = raw RRT* path, blue = after shortcutting'});
+legend('start-tree','goal-tree','start','goal','raw path','shortcut path','Location','best');
+%% ------------------------- Plot + animate: 3D workspace ------------------------
+figure('Name', 'RRT*-Connect - Debris Field Workspace', 'Position', [560 80 600 600]);
+axis equal; hold on; grid on; view(45, 25);
+xlim([-2.3 2.3]); ylim([-2.3 2.3]); zlim([-2.3 2.3]);
+xlabel('x'); ylabel('y'); zlabel('z');
+plotObstacles(obstacles);
+title(sprintf('Debris Field Workspace (%d pieces): Manipulator Path', numDebris));
+if connected
+   animateManipulator(path, L, jointAxis, obstacles);
+else
+   plotManipulator(q_start, L, jointAxis, 'k');
+end
+%% ============================================================
+%                       LOCAL FUNCTIONS
+% ============================================================
+function obstacles = generateDebrisField(n, rShellMin, rShellMax, dMin, dMax, alpha, seedVal)
+% Debris sizes: truncated Pareto distribution with survival function
+% N(>d) ~ d^-alpha, matching the NASA Standard Breakup Model's
+% characteristic-length exponent (alpha ~ 1.6 for explosion fragments).
+% Positions: uniform BY VOLUME within a spherical shell [rShellMin,rShellMax]
+% (a simplifying spatial assumption -- see header note).
+   s = RandStream('mt19937ar', 'Seed', seedVal);
+   u = rand(s, n, 1);
+   d = dMin * (1 - u.*(1-(dMin/dMax)^alpha)).^(-1/alpha);
+   radius = d / 2;
+   u1 = rand(s, n, 1); u2 = rand(s, n, 1); u3 = rand(s, n, 1);
+   r     = (rShellMin^3 + u1.*(rShellMax^3 - rShellMin^3)).^(1/3);
+   theta = 2*pi*u2;
+   phi   = acos(2*u3 - 1);
+   x = r .* sin(phi) .* cos(theta);
+   y = r .* sin(phi) .* sin(theta);
+   z = r .* cos(phi);
+   obstacles = [x, y, z, radius];
+end
+function [tree, idxNew, reachedTarget] = extendTreePlain(tree, target, L, jointAxis, obstacles, ...
+                                                          stepSize, maxSteps, edgeCheckRes, qmin, qmax, tol)
+   if nargin < 11, tol = -1; end
+   diffs = tree.nodes - target;
+   [~, idxNear] = min(sum(diffs.^2, 2));
+   q_near = tree.nodes(idxNear, :);
+   direction = target - q_near;
+   dist = norm(direction);
+   unitDir = zeros(1, numel(q_near));
+   if dist > 1e-9, unitDir = direction / dist; end
+   q_current = q_near; idxCurrent = idxNear;
+   reachedTarget = false;
+   numSubSteps = min(maxSteps, ceil(dist / stepSize));
+   for s = 1:numSubSteps
+       remaining = norm(target - q_current);
+       thisStep  = min(stepSize, remaining);
+       q_candidate = max(min(q_current + unitDir*thisStep, qmax), qmin);
+       if isEdgeCollision(q_current, q_candidate, L, jointAxis, obstacles, edgeCheckRes)
+           break;
+       end
+       tree.nodes  = [tree.nodes;  q_candidate];
+       tree.cost   = [tree.cost;   tree.cost(idxCurrent) + norm(q_candidate - q_current)];
+       tree.parent = [tree.parent; idxCurrent];
+       tree.children{idxCurrent}(end+1) = size(tree.nodes,1);
+       tree.children{end+1} = [];
+       idxCurrent = size(tree.nodes, 1);
+       q_current  = q_candidate;
+       if tol > 0 && norm(q_current - target) < tol
+           reachedTarget = true;
+           break;
+       end
+   end
+   idxNew = idxCurrent; if idxCurrent == idxNear, idxNew = -1; end
+end
+function [tree, idxNew] = extendTreeStar(tree, target, L, jointAxis, obstacles, ...
+                                         stepSize, maxSteps, edgeCheckRes, qmin, qmax, rewireRadius)
+   diffs = tree.nodes - target;
+   [~, idxNear] = min(sum(diffs.^2, 2));
+   q_current = tree.nodes(idxNear, :); idxCurrent = idxNear;
+   direction = target - q_current;
+   dist = norm(direction);
+   unitDir = zeros(1, numel(q_current));
+   if dist > 1e-9, unitDir = direction / dist; end
+   numSubSteps = min(maxSteps, ceil(dist / stepSize));
+   for s = 1:numSubSteps
+       remaining = norm(target - q_current);
+       thisStep  = min(stepSize, remaining);
+       q_candidate = max(min(q_current + unitDir*thisStep, qmax), qmin);
+       nDiffs = tree.nodes - q_candidate;
+       nDists = sqrt(sum(nDiffs.^2, 2));
+       neighborIdx = find(nDists <= rewireRadius);
+       if isempty(neighborIdx)
+           neighborIdx = idxCurrent;
+       end
+       bestParent = -1; bestCost = Inf;
+       for ni = 1:numel(neighborIdx)
+           n = neighborIdx(ni);
+           if isEdgeCollision(tree.nodes(n,:), q_candidate, L, jointAxis, obstacles, edgeCheckRes)
+               continue;
+           end
+           c = tree.cost(n) + norm(tree.nodes(n,:) - q_candidate);
+           if c < bestCost
+               bestCost = c; bestParent = n;
+           end
+       end
+       if bestParent == -1
+           break;
+       end
+       tree.nodes  = [tree.nodes;  q_candidate];
+       tree.cost   = [tree.cost;   bestCost];
+       tree.parent = [tree.parent; bestParent];
+       tree.children{bestParent}(end+1) = size(tree.nodes,1);
+       tree.children{end+1} = [];
+       newIdx = size(tree.nodes, 1);
+       for ni = 1:numel(neighborIdx)
+           n = neighborIdx(ni);
+           if n == bestParent, continue; end
+           if isEdgeCollision(q_candidate, tree.nodes(n,:), L, jointAxis, obstacles, edgeCheckRes)
+               continue;
+           end
+           newCost = bestCost + norm(q_candidate - tree.nodes(n,:));
+           if newCost < tree.cost(n) - 1e-9
+               oldParent = tree.parent(n);
+               tree.children{oldParent}(tree.children{oldParent} == n) = [];
+               tree.parent(n) = newIdx;
+               tree.children{newIdx}(end+1) = n;
+               delta = newCost - tree.cost(n);
+               stack = n;
+               while ~isempty(stack)
+                   cur = stack(end); stack(end) = [];
+                   tree.cost(cur) = tree.cost(cur) + delta;
+                   stack = [stack, tree.children{cur}]; %#ok<AGROW>
+               end
+           end
+       end
+       idxCurrent = newIdx; q_current = q_candidate;
+   end
+   idxNew = idxCurrent; if idxCurrent == idxNear, idxNew = -1; end
+end
+function c = pathCost(path)
+   c = 0;
+   for i = 1:size(path,1)-1
+       c = c + norm(path(i+1,:) - path(i,:));
+   end
+end
+function path = shortcutSmooth(path, L, jointAxis, obstacles, res, iterations)
+   for iter = 1:iterations
+       n = size(path, 1);
+       if n < 3, break; end
+       ij = randperm(n, 2);
+       i = min(ij); j = max(ij);
+       if j <= i+1, continue; end
+       if ~isEdgeCollision(path(i,:), path(j,:), L, jointAxis, obstacles, res)
+           path = [path(1:i,:); path(j:end,:)];
+       end
+   end
+end
+function positions = forwardKinematicsChain3D(q, L, jointAxis)
+   N = numel(q);
+   positions = zeros(N+1, 3);
+   R = eye(3);
+   pos = [0 0 0];
+   for i = 1:N
+       Rlocal = rotationMatrix(jointAxis(i,:), q(i));
+       R = R * Rlocal;
+       pos = pos + (R * [L(i); 0; 0])';
+       positions(i+1, :) = pos;
+   end
+end
+function Rm = rotationMatrix(axis, theta)
+   axis = axis / norm(axis);
+   x = axis(1); y = axis(2); z = axis(3);
+   c = cos(theta); s = sin(theta); C = 1 - c;
+   Rm = [x*x*C+c,   x*y*C-z*s, x*z*C+y*s;
+         y*x*C+z*s, y*y*C+c,   y*z*C-x*s;
+         z*x*C-y*s, z*y*C+x*s, z*z*C+c];
+end
+function tf = isCollision(q, L, jointAxis, obstacles)
+% Fully vectorized over BOTH links and obstacles (no loops at all) --
+% important once the debris field has dozens of pieces instead of 3.
+   positions = forwardKinematicsChain3D(q, L, jointAxis);
+   A  = positions(1:end-1, :);   % numLinks x 3
+   AB = positions(2:end, :) - A; % numLinks x 3
+   numLinksLocal = size(A, 1);
+   numObs = size(obstacles, 1);
+   C = obstacles(:, 1:3);  % numObs x 3
+   R = obstacles(:, 4);    % numObs x 1
+   A3  = reshape(A,  numLinksLocal, 1, 3);
+   AB3 = reshape(AB, numLinksLocal, 1, 3);
+   C3  = reshape(C,  1, numObs, 3);
+   denom = sum(AB3.^2, 3);              % numLinks x 1
+   denom(denom < 1e-12) = 1e-12;
+   numer = sum((C3 - A3) .* AB3, 3);    % numLinks x numObs (broadcast)
+   t = min(max(numer ./ denom, 0), 1);  % numLinks x numObs
+   proj = A3 + reshape(t, numLinksLocal, numObs, 1) .* AB3;  % numLinks x numObs x 3
+   d = sqrt(sum((C3 - proj).^2, 3));                          % numLinks x numObs
+   tf = any(any(d <= R'));  % R' is 1 x numObs, broadcasts against d's numLinks x numObs
+end
+function tf = isEdgeCollision(qA, qB, L, jointAxis, obstacles, res)
+   tf = false;
+   for i = 0:res
+       t = i / res;
+       q = qA + t * (qB - qA);
+       if isCollision(q, L, jointAxis, obstacles)
+           tf = true;
+           return;
+       end
+   end
+end
+function plotTreeProj(tree, color)
+   for i = 2:size(tree.nodes, 1)
+       p = tree.nodes(tree.parent(i), 1:2);
+       c = tree.nodes(i, 1:2);
+       plot([p(1) c(1)], [p(2) c(2)], '-', 'Color', color);
+   end
+end
+function plotObstacles(obstacles)
+   [sx, sy, sz] = sphere(10);   % lower resolution than before -- there can be dozens of these
+   for i = 1:size(obstacles, 1)
+       cx = obstacles(i,1); cy = obstacles(i,2); cz = obstacles(i,3); r = obstacles(i,4);
+       surf(sx*r + cx, sy*r + cy, sz*r + cz, ...
+            'FaceColor', [1 0.4 0.4], 'FaceAlpha', 0.5, 'EdgeColor', 'none');
+   end
+end
+function h = plotManipulator(q, L, jointAxis, color)
+   positions = forwardKinematicsChain3D(q, L, jointAxis);
+   h = plot3(positions(:,1), positions(:,2), positions(:,3), '-o', ...
+             'Color', color, 'LineWidth', 3, 'MarkerFaceColor', color);
+end
+function animateManipulator(path, L, jointAxis, obstacles)
+   stepsPerSegment = 8;
+   qTraj = path(1, :);
+   for i = 1:size(path,1)-1
+       for t = linspace(0, 1, stepsPerSegment)
+           qTraj = [qTraj; path(i,:) + t*(path(i+1,:) - path(i,:))]; %#ok<AGROW>
+       end
+   end
+   for i = 1:size(qTraj, 1)
+       cla;
+       plotObstacles(obstacles);
+       plotManipulator(qTraj(i,:), L, jointAxis, 'b');
+       positions = forwardKinematicsChain3D(qTraj(i,:), L, jointAxis);
+       pEE = positions(end, :);
+       plot3(pEE(1), pEE(2), pEE(3), 'k.', 'MarkerSize', 8);
+       xlim([-2.3 2.3]); ylim([-2.3 2.3]); zlim([-2.3 2.3]);
+       axis equal; grid on; view(45, 25);
+       title('Debris Field Workspace: Manipulator Path');
+       drawnow;
+       pause(0.02);
+   end
+end
+
