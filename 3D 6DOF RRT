@@ -1,0 +1,356 @@
+%% RRT_manipulator_6DOF_3D.m  (bidirectional RRT-Connect, 3D workspace)
+%
+% Generalizes the previous 2D-workspace 6-DOF planar arm to a real 3D
+% workspace. IMPORTANT: the RRT-CONNECT ALGORITHM ITSELF IS UNCHANGED.
+% Configuration space is still R^6 (six joint angles) -- what changed is
+% only how a configuration maps to points in the workspace (forward
+% kinematics) and how obstacles are represented there. Since RRT-Connect
+% operates purely on the configuration vector q and a collision-check
+% function, none of extendTree/nearest-neighbor/path-backtracking needed
+% to change at all.
+%
+% WHAT HAD TO CHANGE, AND WHY (read this before changing q_start/q_goal):
+%
+% 1) FORWARD KINEMATICS -- this is the one genuinely new piece of design.
+%    In 2D, every joint implicitly rotates about the single "out of
+%    plane" axis, so a config was just a chain of cumulative angles.
+%    In 3D there is no such implicit axis: each joint needs its OWN
+%    rotation axis, or all 6 joints would rotate about the same axis and
+%    the arm would stay stuck in one plane (not actually "3D" motion).
+%    This code uses the standard convention for a simple serial arm:
+%    ODD joints (1,3,5) rotate about the LOCAL z-axis ("yaw"), EVEN
+%    joints (2,4,6) rotate about the LOCAL y-axis ("pitch"). This is
+%    implemented with a proper rotation-matrix chain (Rodrigues'
+%    formula), not just angle addition.
+%
+% 2) OBSTACLES -- circles [x,y,r] become spheres [x,y,z,r]. The point-
+%    to-segment collision math itself did NOT need to change: dot
+%    products, norms, and projections work identically in 3D as in 2D
+%    (this is just generic vector algebra), so isCollision/isEdgeCollision
+%    only needed their inputs widened from 2 to 3 columns.
+%
+% 3) VISUALIZATION -- the workspace plot now uses plot3/view and draws
+%    wireframe spheres instead of circles. The configuration-space plot
+%    is UNCHANGED (still a 2D projection onto theta1/theta2 -- it was
+%    already just a projection of a 6-D space, so moving the workspace
+%    from 2D to 3D doesn't affect it at all).
+%
+% 4) START/GOAL -- kept the same joint values as the 2D version
+%    ([-pi/2,0,...] and [pi/6,pi/12,-pi/3,0,0,0]), but they now produce
+%    genuinely different (and genuinely 3D) arm postures, because joint
+%    2 is now a PITCH rotation instead of an in-plane rotation. Verified
+%    collision-free with the new kinematics before shipping this.
+%
+% RRT-CONNECT PARAMETERS (K, stepSize, maxExtendSteps, connectCap,
+% edgeCheckRes, goalTol) ARE UNCHANGED from the 2D version.
+%
+% No toolboxes required - pure base MATLAB.
+clear; clc; close all;
+rng(1);
+%% ------------------------- Robot parameters -------------------------
+numLinks = 6;
+L = ones(1, numLinks) * (2/numLinks);   % unchanged: total reach = 2.0
+% Joint rotation axes (defined in each joint's LOCAL frame, i.e. relative
+% to the orientation of the previous link -- NOT fixed world axes).
+% Odd joints = yaw (local z), even joints = pitch (local y).
+jointAxis = zeros(numLinks, 3);
+for i = 1:numLinks
+   if mod(i,2) == 1
+       jointAxis(i,:) = [0 0 1];   % yaw
+   else
+       jointAxis(i,:) = [0 1 0];   % pitch
+   end
+end
+%% ------------------------- Configuration space ------------------------
+qmin = -pi * ones(1, numLinks);
+qmax =  pi * ones(1, numLinks);
+%% ------------------------- Start / goal --------------------------------
+% Same joint VALUES as the 2D version (re-verified collision-free below
+% under the new 3D kinematics -- see header note #4).
+q_start = zeros(1, numLinks);
+q_start(1) = -pi/2;
+q_goal = zeros(1, numLinks);
+q_goal(1) = pi/6;
+q_goal(2) = pi/12;
+q_goal(3) = -pi/3;
+%% ------------------------- Obstacles (workspace) -----------------------
+% Circles [x,y,r] -> spheres [x,y,z,r]. Same x,y,r as the 2D version,
+% placed at z=0 (the plane the arm starts in).
+obstacles = [ 1.04   1.04   0.0   0.25;
+            -0.65   1.30   0.0   0.20;
+             1.30  -0.65   0.0   0.20];
+%% ------------------------- RRT-Connect parameters ------------------------
+% UNCHANGED from the 2D version.
+K               = 1000;
+stepSize        = 0.20;
+maxExtendSteps  = 25;
+connectCap      = 300;
+edgeCheckRes    = 5;
+goalTol         = 0.10;
+%% ------------------------- Sanity checks ---------------------------------
+startBad = isCollision(q_start, L, jointAxis, obstacles);
+goalBad  = isCollision(q_goal,  L, jointAxis, obstacles);
+if startBad || goalBad
+   figure('Name', 'Collision Preview', 'Position', [50 80 500 500]);
+   axis equal; hold on; grid on; view(45, 25);
+   xlim([-2.2 2.2]); ylim([-2.2 2.2]); zlim([-2.2 2.2]);
+   plotObstacles(obstacles);
+   if startBad
+       plotManipulator(q_start, L, jointAxis, 'r');
+   end
+   if goalBad
+       plotManipulator(q_goal, L, jointAxis, 'm');
+   end
+   title('Fix q\_start / q\_goal / obstacles, then re-run');
+   drawnow;
+end
+if startBad
+   error('Start configuration is in collision with an obstacle. See the Collision Preview figure.');
+end
+if goalBad
+   error('Goal configuration is in collision with an obstacle. See the Collision Preview figure.');
+end
+%% ------------------------- Initialize two trees -----------------------------
+treeA.nodes  = q_start;  treeA.parent = 0;
+treeB.nodes  = q_goal;   treeB.parent = 0;
+aIsStart = true;
+connected  = false;
+idxConnA   = -1;
+idxConnB   = -1;
+fprintf('Building bidirectional RRT-Connect (config-space dim = %d, workspace = 3D) ...\n', numLinks);
+tic;
+for k = 1:K
+   q_rand = qmin + rand(1, numLinks) .* (qmax - qmin);
+   [treeA, idxNewA, ~] = extendTree(treeA, q_rand, L, jointAxis, obstacles, ...
+                                     stepSize, maxExtendSteps, edgeCheckRes, qmin, qmax);
+   if idxNewA ~= -1
+       target = treeA.nodes(idxNewA, :);
+       [treeB, idxNewB, reachedB] = extendTree(treeB, target, L, jointAxis, obstacles, ...
+                                                stepSize, connectCap, edgeCheckRes, qmin, qmax, goalTol);
+       if reachedB
+           connected = true;
+           idxConnA = idxNewA;
+           idxConnB = idxNewB;
+           fprintf('Trees connected at iteration %d (sizes: %d + %d = %d nodes)\n', ...
+                    k, size(treeA.nodes,1), size(treeB.nodes,1), ...
+                    size(treeA.nodes,1)+size(treeB.nodes,1));
+           break;
+       end
+   end
+   tmp = treeA; treeA = treeB; treeB = tmp;
+   aIsStart = ~aIsStart;
+   if mod(k, 100) == 0
+       fprintf('  iter %4d | tree sizes: %d + %d | elapsed: %.1fs\n', ...
+               k, size(treeA.nodes,1), size(treeB.nodes,1), toc);
+   end
+end
+elapsedTime = toc;
+if ~connected
+   fprintf('Trees NOT connected within %d iterations (%.1fs elapsed). Try increasing K.\n', K, elapsedTime);
+else
+   fprintf('Done in %.2f seconds.\n', elapsedTime);
+end
+%% ------------------------- Extract path (backtrack both trees) ------------------------
+path = [];
+if connected
+   pathA = [];
+   idx = idxConnA;
+   while idx ~= 0
+       pathA = [treeA.nodes(idx, :); pathA]; %#ok<AGROW>
+       idx = treeA.parent(idx);
+   end
+   pathB = [];
+   idx = idxConnB;
+   while idx ~= 0
+       pathB = [treeB.nodes(idx, :); pathB]; %#ok<AGROW>
+       idx = treeB.parent(idx);
+   end
+   if aIsStart
+       path = [pathA; flipud(pathB)];
+   else
+       path = [pathB; flipud(pathA)];
+   end
+   fprintf('Path found with %d waypoints.\n', size(path,1));
+end
+%% ------------------------- Plot: configuration space (projection) ----------
+% UNCHANGED from the 2D version -- still just a projection onto (theta1,theta2).
+figure('Name', 'RRT-Connect - Configuration Space (theta1-theta2 projection)', ...
+      'Position', [50 80 480 480]);
+hold on; axis equal; grid on;
+if aIsStart
+   plotTreeProj(treeA, [0.6 0.8 1.0]);
+   plotTreeProj(treeB, [1.0 0.8 0.6]);
+else
+   plotTreeProj(treeB, [0.6 0.8 1.0]);
+   plotTreeProj(treeA, [1.0 0.8 0.6]);
+end
+plot(q_start(1), q_start(2), 'go', 'MarkerFaceColor', 'g', 'MarkerSize', 9);
+plot(q_goal(1),  q_goal(2),  'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 9);
+if connected
+   plot(path(:,1), path(:,2), 'b-', 'LineWidth', 2);
+end
+xlabel('\theta_1 (rad)'); ylabel('\theta_2 (rad)');
+title({'RRT-Connect trees - projection onto (\theta_1,\theta_2)', ...
+      'blue=start-tree, orange=goal-tree (actual trees live in 6-D)'});
+%% ------------------------- Plot + animate: 3D workspace ------------------------
+figure('Name', 'RRT-Connect - 3D Workspace', 'Position', [560 80 560 560]);
+axis equal; hold on; grid on; view(45, 25);
+xlim([-2.2 2.2]); ylim([-2.2 2.2]); zlim([-2.2 2.2]);
+xlabel('x'); ylabel('y'); zlabel('z');
+plotObstacles(obstacles);
+title('3D Workspace: Manipulator Path');
+if connected
+   animateManipulator(path, L, jointAxis, obstacles);
+else
+   plotManipulator(q_start, L, jointAxis, 'k');
+end
+%% ============================================================
+%                       LOCAL FUNCTIONS
+% ============================================================
+function [tree, idxNew, reachedTarget] = extendTree(tree, target, L, jointAxis, obstacles, ...
+                                                     stepSize, maxSteps, edgeCheckRes, qmin, qmax, tol)
+% UNCHANGED algorithm from the 2D version -- operates purely on q vectors.
+   if nargin < 11
+       tol = -1;
+   end
+   diffs = tree.nodes - target;
+   dists = sum(diffs.^2, 2);
+   [~, idxNear] = min(dists);
+   q_near = tree.nodes(idxNear, :);
+   direction = target - q_near;
+   dist = norm(direction);
+   if dist > 1e-9
+       unitDir = direction / dist;
+   else
+       unitDir = zeros(1, numel(q_near));
+   end
+   q_current  = q_near;
+   idxCurrent = idxNear;
+   reachedTarget = false;
+   numSubSteps = min(maxSteps, ceil(dist / stepSize));
+   for s = 1:numSubSteps
+       remaining = norm(target - q_current);
+       thisStep  = min(stepSize, remaining);
+       q_candidate = q_current + unitDir * thisStep;
+       q_candidate = max(min(q_candidate, qmax), qmin);
+       if isEdgeCollision(q_current, q_candidate, L, jointAxis, obstacles, edgeCheckRes)
+           break;
+       end
+       tree.nodes  = [tree.nodes;  q_candidate];
+       tree.parent = [tree.parent; idxCurrent];
+       idxCurrent  = size(tree.nodes, 1);
+       q_current   = q_candidate;
+       if tol > 0 && norm(q_current - target) < tol
+           reachedTarget = true;
+           break;
+       end
+   end
+   if idxCurrent == idxNear
+       idxNew = -1;
+   else
+       idxNew = idxCurrent;
+   end
+end
+function Rm = rotationMatrix(axis, theta)
+% Rodrigues' rotation formula: rotation matrix for angle theta about
+% the given axis (need not be a coordinate axis, works for any unit
+% vector -- kept general in case you want non-yaw/pitch joints later).
+   axis = axis / norm(axis);
+   x = axis(1); y = axis(2); z = axis(3);
+   c = cos(theta); s = sin(theta); C = 1 - c;
+   Rm = [x*x*C+c,   x*y*C-z*s, x*z*C+y*s;
+         y*x*C+z*s, y*y*C+c,   y*z*C-x*s;
+         z*x*C-y*s, z*y*C+x*s, z*z*C+c];
+end
+function positions = forwardKinematicsChain3D(q, L, jointAxis)
+% 3D forward kinematics: each joint rotates about its own LOCAL axis
+% (jointAxis(i,:), defined relative to the previous link's orientation),
+% then the next link extends along the new local x-axis.
+   N = numel(q);
+   positions = zeros(N+1, 3);
+   R = eye(3);
+   pos = [0 0 0];
+   for i = 1:N
+       Rlocal = rotationMatrix(jointAxis(i,:), q(i));
+       R = R * Rlocal;
+       pos = pos + (R * [L(i); 0; 0])';
+       positions(i+1, :) = pos;
+   end
+end
+function tf = isCollision(q, L, jointAxis, obstacles)
+% Same vectorized point-to-segment logic as the 2D version -- the math
+% is identical in 3D, only the column count of the position arrays changed.
+   positions = forwardKinematicsChain3D(q, L, jointAxis);
+   A = positions(1:end-1, :);
+   B = positions(2:end,   :);
+   AB = B - A;
+   denom = sum(AB.^2, 2);
+   denom(denom < 1e-12) = 1e-12;
+   tf = false;
+   for i = 1:size(obstacles, 1)
+       c = obstacles(i, 1:3);
+       r = obstacles(i, 4);
+       t = sum((c - A) .* AB, 2) ./ denom;
+       t = min(max(t, 0), 1);
+       proj = A + t .* AB;
+       d = sqrt(sum((c - proj).^2, 2));
+       if any(d <= r)
+           tf = true;
+           return;
+       end
+   end
+end
+function tf = isEdgeCollision(qA, qB, L, jointAxis, obstacles, res)
+   tf = false;
+   for i = 0:res
+       t = i / res;
+       q = qA + t * (qB - qA);
+       if isCollision(q, L, jointAxis, obstacles)
+           tf = true;
+           return;
+       end
+   end
+end
+function plotTreeProj(tree, color)
+   for i = 2:size(tree.nodes, 1)
+       p = tree.nodes(tree.parent(i), 1:2);
+       c = tree.nodes(i, 1:2);
+       plot([p(1) c(1)], [p(2) c(2)], '-', 'Color', color);
+   end
+end
+function plotObstacles(obstacles)
+% Draw each obstacle as a translucent wireframe/surface sphere.
+   [sx, sy, sz] = sphere(16);
+   for i = 1:size(obstacles, 1)
+       cx = obstacles(i,1); cy = obstacles(i,2); cz = obstacles(i,3); r = obstacles(i,4);
+       surf(sx*r + cx, sy*r + cy, sz*r + cz, ...
+            'FaceColor', [1 0.4 0.4], 'FaceAlpha', 0.4, 'EdgeColor', 'none');
+   end
+end
+function h = plotManipulator(q, L, jointAxis, color)
+   positions = forwardKinematicsChain3D(q, L, jointAxis);
+   h = plot3(positions(:,1), positions(:,2), positions(:,3), '-o', ...
+             'Color', color, 'LineWidth', 3, 'MarkerFaceColor', color);
+end
+function animateManipulator(path, L, jointAxis, obstacles)
+   stepsPerSegment = 5;
+   qTraj = path(1, :);
+   for i = 1:size(path,1)-1
+       for t = linspace(0, 1, stepsPerSegment)
+           qTraj = [qTraj; path(i,:) + t*(path(i+1,:) - path(i,:))]; %#ok<AGROW>
+       end
+   end
+   for i = 1:size(qTraj, 1)
+       cla;
+       plotObstacles(obstacles);
+       plotManipulator(qTraj(i,:), L, jointAxis, 'b');
+       positions = forwardKinematicsChain3D(qTraj(i,:), L, jointAxis);
+       pEE = positions(end, :);
+       plot3(pEE(1), pEE(2), pEE(3), 'k.', 'MarkerSize', 8);
+       xlim([-2.2 2.2]); ylim([-2.2 2.2]); zlim([-2.2 2.2]);
+       axis equal; grid on; view(45, 25);
+       title('3D Workspace: Manipulator Path');
+       drawnow;
+       pause(0.03);
+   end
+end
