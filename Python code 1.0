@@ -1,0 +1,570 @@
+"""
+debris_tracking_demo.py
+=======================
+
+End-to-end demo of the Path Planning team's job:
+
+    "Given RGB-D images from the end-effector camera, keep the debris in
+     view and hold the distance threshold."
+
+The scene
+---------
+* Debris-centred LVLH frame: debris at the origin, fixed (as the brief says).
+* The BIG testbed manipulator carries the chaser along the given trajectory
+  (1.5 m -> 0.3 m). In this demo we assume the big arm does that perfectly,
+  so the chaser position is read straight from the trajectory file.
+* A SMALL 6-DOF arm is mounted on the chaser. Its base therefore moves with
+  the trajectory. A RealSense-like RGB-D camera sits at its end effector.
+* Goal of the small arm: keep the debris at the CENTRE of the image and hold
+  a DESIRED DISTANCE between camera and debris.
+
+What happens every camera frame (the loop you are building)
+------------------------------------------------------------
+  1. CAMERA      render an RGB image + a depth image from the camera pose
+                 (in the real system: the RealSense driver gives you these)
+  2. DETECT      find which pixels belong to the debris  -> binary mask
+  3. CENTROID    average pixel position of the mask       -> (u, v)
+  4. RANGE       median depth over the mask                -> Z
+  5. BACK-PROJECT pinhole model with intrinsics            -> debris (X,Y,Z)
+                 in the camera optical frame
+  6. SETPOINT    where should the camera go, and where should it look?
+                 -> THIS IS YOUR TEAM'S OUTPUT (camera optical frame)
+  -------------------------------------------------------------------------
+  7. [Manipulator team] convert setpoint to world frame, run IK, move arm.
+     A simple damped-least-squares IK is included here ONLY so the loop
+     can be closed and you can watch it work.
+
+Steps 1-6 are yours. Steps 1 and 7 are stand-ins for hardware / other teams.
+
+Run
+---
+    pip install numpy matplotlib pandas openpyxl pillow
+    python debris_tracking_demo.py trajectory_orbit_lvlh.xlsx
+    python debris_tracking_demo.py trajectory_orbit_lvlh.xlsx --gif   # also save an animation
+
+Frames and conventions used (agree these with the Manipulator team!)
+--------------------------------------------------------------------
+* World = debris-centred LVLH, metres, right-handed. Trajectory x = radial,
+  y = along-track, z = cross-track (z = 0 for this trajectory).
+* Camera OPTICAL frame (OpenCV / ROS convention):
+      +z forward (out of the lens), +x right in the image, +y down in the image.
+* Pixel coordinates: u = column (right), v = row (down), origin top-left.
+"""
+
+import sys
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib import animation
+
+
+# =============================================================================
+# CONFIGURATION  -- everything you are likely to want to change is here
+# =============================================================================
+CFG = dict(
+    # --- loop timing ---
+    frame_step=2,            # use every Nth trajectory row (file is 0.1 s -> 0.2 s = 5 Hz camera)
+
+    # --- camera intrinsics (roughly a RealSense D435 colour stream, downscaled) ---
+    img_w=320, img_h=240,
+    fx=240.0, fy=240.0,      # focal lengths in pixels  (HFOV ~ 67 deg)
+    cx=159.5, cy=119.5,      # principal point (image centre)
+    depth_min=0.20,          # RealSense cannot measure closer than this (m)
+    depth_max=3.0,           # ... or farther than this (for our purposes)
+    depth_noise_a=0.001,     # depth noise sigma = a + b * Z^2  (stereo depth error grows with Z^2)
+    depth_noise_b=0.0025,
+    depth_dropout=0.03,      # fraction of pixels with no depth return (holes)
+    rgb_noise=0.02,          # colour sensor noise
+    num_stars=400,           # background stars: bright in RGB but NO depth
+
+    # --- debris model (a tumbling box, roughly a small satellite body) ---
+    debris_half=np.array([0.10, 0.10, 0.15]),   # half-extents (m) -> 0.2 x 0.2 x 0.3 m
+    debris_spin_deg_s=1.5,                      # tumble rate
+    debris_spin_axis=np.array([0.3, 0.2, 1.0]),
+    sun_dir=np.array([-0.6, -0.6, 0.5]),        # direction TO the sun (world); roughly behind the chaser
+
+    # --- detection ---
+    det_min_brightness=0.04, # pixel must be at least this bright ...
+    det_max_range=2.5,       # ... AND have a valid depth closer than this
+    det_min_pixels=30,       # fewer mask pixels than this = "debris lost"
+    centre_offset=0.10,      # median depth measures the SURFACE; add ~half the debris
+                             # size to estimate the CENTRE (known approx. size)
+
+    # --- your controller (setpoint generator) ---
+    desired_distance=0.50,   # camera-to-debris distance to hold (m)
+    smoothing=0.5,           # move only this fraction toward the new setpoint each frame
+    deadband_dist=0.005,     # ignore range errors smaller than this (m)
+
+    # --- small arm (stand-in for the Manipulator team's arm) ---
+    num_links=6,
+    link_len=0.06,           # 6 x 0.06 = 0.36 m total reach
+    ik_iters=15,
+    ik_damping=0.05,
+    ik_rot_weight=0.3,       # how much pointing error counts vs position error
+)
+
+
+# =============================================================================
+# 1.  TRAJECTORY  (chaser = small-arm base, carried by the big arm)
+# =============================================================================
+def load_trajectory(path):
+    """Accepts the brief's CSV or the provided XLSX. Uses the first 4 columns
+    as t, x, y, z regardless of their header names."""
+    if path.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+    arr = df.iloc[:, :4].to_numpy(dtype=float)
+    return arr[:, 0], arr[:, 1:4]
+
+
+# =============================================================================
+# 2.  SMALL ARM KINEMATICS  (stand-in for the Manipulator team)
+# =============================================================================
+def rot(axis, theta):
+    """Rodrigues rotation matrix about a unit axis."""
+    axis = axis / np.linalg.norm(axis)
+    x, y, z = axis
+    c, s, C = np.cos(theta), np.sin(theta), 1 - np.cos(theta)
+    return np.array([[x*x*C + c,   x*y*C - z*s, x*z*C + y*s],
+                     [y*x*C + z*s, y*y*C + c,   y*z*C - x*s],
+                     [z*x*C - y*s, z*y*C + x*s, z*z*C + c]])
+
+
+class SmallArm:
+    """6-DOF serial arm, alternating yaw / pitch joints (same model as the
+    earlier RRT scripts, scaled down). Links extend along each joint's local x.
+    Base is mounted on the chaser with local x pointing along +y (toward the
+    debris at the start of the approach)."""
+
+    def __init__(self, cfg):
+        self.n = cfg["num_links"]
+        self.L = np.full(self.n, cfg["link_len"])
+        self.reach = self.L.sum()
+        self.axes = [np.array([0, 0, 1.0]) if i % 2 == 0 else np.array([0, 1.0, 0])
+                     for i in range(self.n)]
+        self.R_base = rot(np.array([0, 0, 1.0]), np.pi / 2)   # local x -> world +y
+        self.q = np.zeros(self.n)
+
+    def fk(self, q, base_pos):
+        """Returns joint positions (n+1 x 3) and end-effector rotation."""
+        R = self.R_base.copy()
+        p = base_pos.copy()
+        pts = [p.copy()]
+        for i in range(self.n):
+            R = R @ rot(self.axes[i], q[i])
+            p = p + R @ np.array([self.L[i], 0, 0])
+            pts.append(p.copy())
+        return np.array(pts), R
+
+    @staticmethod
+    def camera_rotation(R_ee):
+        """Camera OPTICAL frame from the end-effector frame.
+        Optical z (forward) = link x;  optical x (right) = -link y;
+        optical y (down) = -link z.  Columns of the result are the camera
+        axes expressed in world coordinates."""
+        return np.column_stack([-R_ee[:, 1], -R_ee[:, 2], R_ee[:, 0]])
+
+    def camera_pose(self, base_pos):
+        pts, R = self.fk(self.q, base_pos)
+        return pts[-1], self.camera_rotation(R)
+
+    def ik_step(self, base_pos, p_des, look_at, cfg):
+        """Damped-least-squares IK toward a camera position + look-at point.
+        Warm-started from the current joint angles."""
+        w = cfg["ik_rot_weight"]
+        lam2 = cfg["ik_damping"] ** 2
+        q = self.q.copy()
+
+        def task_error(qq):
+            pts, R = self.fk(qq, base_pos)
+            z_cam = R[:, 0]
+            z_des = look_at - pts[-1]
+            z_des /= (np.linalg.norm(z_des) + 1e-12)
+            e_pos = p_des - pts[-1]
+            e_rot = np.cross(z_cam, z_des) * w
+            return np.concatenate([e_pos, e_rot])
+
+        for _ in range(cfg["ik_iters"]):
+            e = task_error(q)
+            if np.linalg.norm(e) < 1e-4:
+                break
+            J = np.zeros((6, self.n))
+            eps = 1e-5
+            for j in range(self.n):
+                dq = np.zeros(self.n); dq[j] = eps
+                J[:, j] = -(task_error(q + dq) - e) / eps   # d(-e)/dq = d(task)/dq
+            step = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), e)
+            step = np.clip(step, -0.2, 0.2)
+            q = np.clip(q + step, -np.pi, np.pi)
+        self.q = q
+
+
+# =============================================================================
+# 3.  SYNTHETIC RGB-D CAMERA  (stand-in for the RealSense / Unity renderer)
+# =============================================================================
+class SyntheticCamera:
+    """Ray-casts a tumbling box and produces what a RealSense would give you:
+       * rgb   (H x W x 3, 0..1) -- shaded debris + background stars
+       * depth (H x W, metres)   -- Z along the optical axis, 0 = no return
+    Also returns the TRUE debris mask, only for scoring the detector."""
+
+    FACE_COLOURS = np.array([
+        [0.85, 0.65, 0.20], [0.85, 0.65, 0.20],   # +/-x : gold MLI foil
+        [0.55, 0.55, 0.60], [0.55, 0.55, 0.60],   # +/-y : grey structure
+        [0.15, 0.25, 0.55], [0.15, 0.25, 0.55],   # +/-z : blue solar cells
+    ])
+
+    def __init__(self, cfg, rng):
+        self.cfg = cfg
+        self.rng = rng
+        W, H = cfg["img_w"], cfg["img_h"]
+        u, v = np.meshgrid(np.arange(W), np.arange(H))
+        # Ray through every pixel in the OPTICAL frame, scaled so z = 1.
+        # => the ray parameter t equals the depth Z directly (like a RealSense).
+        self.rays_cam = np.stack([(u - cfg["cx"]) / cfg["fx"],
+                                  (v - cfg["cy"]) / cfg["fy"],
+                                  np.ones_like(u, dtype=float)], axis=-1).reshape(-1, 3)
+        # fixed star directions in the (inertial-ish) world frame
+        s = rng.normal(size=(cfg["num_stars"], 3))
+        self.stars = s / np.linalg.norm(s, axis=1, keepdims=True)
+        self.sun = cfg["sun_dir"] / np.linalg.norm(cfg["sun_dir"])
+
+    def debris_rotation(self, t):
+        return rot(self.cfg["debris_spin_axis"], np.deg2rad(self.cfg["debris_spin_deg_s"]) * t)
+
+    def render(self, cam_pos, R_cam, t):
+        cfg = self.cfg
+        H, W = cfg["img_h"], cfg["img_w"]
+        h = cfg["debris_half"]
+        R_deb = self.debris_rotation(t)
+
+        # --- ray / box intersection (slab method), done in the box's own frame ---
+        d_world = self.rays_cam @ R_cam.T
+        o_b = R_deb.T @ (cam_pos - 0.0)         # debris centre is the origin
+        d_b = d_world @ R_deb                   # = (R_deb.T @ d.T).T
+        d_b = np.where(np.abs(d_b) < 1e-12, 1e-12, d_b)
+        t1 = (-h - o_b) / d_b
+        t2 = ( h - o_b) / d_b
+        t_lo = np.minimum(t1, t2)
+        t_hi = np.maximum(t1, t2)
+        t_near = t_lo.max(axis=1)
+        t_far = t_hi.min(axis=1)
+        axis_hit = t_lo.argmax(axis=1)
+        hit = (t_far >= t_near) & (t_near > 0)
+
+        # --- shading (Lambertian, sun + small ambient) ---
+        n_b = np.zeros_like(d_b)
+        rows = np.arange(len(d_b))
+        n_b[rows, axis_hit] = -np.sign(d_b[rows, axis_hit])
+        n_w = n_b @ R_deb.T
+        lambert = np.clip(n_w @ self.sun, 0, 1)
+        face = axis_hit * 2 + (n_b[rows, axis_hit] > 0)
+        colour = self.FACE_COLOURS[face] * (0.12 + 0.88 * lambert)[:, None]
+
+        rgb = np.zeros((H * W, 3))
+        rgb[hit] = colour[hit]
+        depth = np.zeros(H * W)
+        depth[hit] = t_near[hit]
+        true_mask = hit.reshape(H, W)
+        rgb = rgb.reshape(H, W, 3)
+        depth = depth.reshape(H, W)
+
+        # --- stars: bright dots in RGB, but NO depth (infinitely far) ---
+        s_cam = self.stars @ R_cam              # star directions in optical frame
+        front = s_cam[:, 2] > 0.1
+        su = np.round(cfg["fx"] * s_cam[front, 0] / s_cam[front, 2] + cfg["cx"]).astype(int)
+        sv = np.round(cfg["fy"] * s_cam[front, 1] / s_cam[front, 2] + cfg["cy"]).astype(int)
+        ok = (su >= 0) & (su < W) & (sv >= 0) & (sv < H)
+        su, sv = su[ok], sv[ok]
+        behind_debris = true_mask[sv, su]
+        rgb[sv[~behind_debris], su[~behind_debris]] = 0.9
+
+        # --- sensor imperfections ---
+        rgb = np.clip(rgb + self.rng.normal(0, cfg["rgb_noise"], rgb.shape), 0, 1)
+        valid = depth > 0
+        sigma = cfg["depth_noise_a"] + cfg["depth_noise_b"] * depth ** 2
+        depth = np.where(valid, depth + self.rng.normal(size=depth.shape) * sigma, 0.0)
+        depth[self.rng.random(depth.shape) < cfg["depth_dropout"]] = 0.0     # holes
+        depth[(depth < cfg["depth_min"]) | (depth > cfg["depth_max"])] = 0.0  # out of range
+        return rgb, depth, true_mask
+
+
+# =============================================================================
+# 4.  YOUR PIPELINE  -- detection -> 3D position -> camera setpoint
+# =============================================================================
+def detect_debris(rgb, depth, cfg):
+    """STEP 2: which pixels are the debris?
+
+    Here: a hand-written rule using BOTH sensors.
+      * RGB brightness alone would also pick up stars.
+      * Depth alone works in this synthetic scene only because empty space
+        returns no depth -- in the lab, the table and walls DO return depth.
+    Combining them gives a clean mask here.
+
+    In your real system this function is where a learned model goes:
+      YOLO (gives a bounding box) or better a segmentation model such as
+      YOLOv8-seg / Mask R-CNN / SAM (gives a per-pixel mask), trained on
+      images of YOUR debris mock-up (renders from the Unity twin + real photos).
+    Everything downstream stays the same, it only needs the mask.
+    """
+    gray = rgb.mean(axis=2)
+    has_depth = (depth > 0) & (depth < cfg["det_max_range"])
+    bright = gray > cfg["det_min_brightness"]
+    return has_depth & bright
+
+
+def estimate_position(mask, depth, cfg):
+    """STEPS 3-5: mask -> (u,v) -> Z -> (X,Y,Z) in the camera optical frame.
+    Returns None if the debris is lost."""
+    vs, us = np.nonzero(mask)
+    if len(us) < cfg["det_min_pixels"]:
+        return None, None
+    u_c, v_c = us.mean(), vs.mean()                 # STEP 3: centroid in pixels
+    Z_surface = np.median(depth[vs, us])            # STEP 4: robust range to the SURFACE
+    Z = Z_surface + cfg["centre_offset"]            #         -> approx. range to the CENTRE
+    X = (u_c - cfg["cx"]) * Z / cfg["fx"]           # STEP 5: pinhole back-projection
+    Y = (v_c - cfg["cy"]) * Z / cfg["fy"]
+    return np.array([X, Y, Z]), (u_c, v_c)
+
+
+def compute_setpoint(p_debris_cam, cfg):
+    """STEP 6: YOUR TEAM'S OUTPUT, in the camera OPTICAL frame.
+
+    The camera currently sits at the origin of its own frame. We want it:
+      * on the line of sight to the debris, at `desired_distance` from it
+      * looking at the debris (this is what keeps it centred in the image)
+
+    Returns: dict with the new camera position and the look-at point,
+             both in the CURRENT camera optical frame.
+    """
+    rng = np.linalg.norm(p_debris_cam)
+    los = p_debris_cam / rng
+    dist_err = rng - cfg["desired_distance"]
+    if abs(dist_err) < cfg["deadband_dist"]:
+        dist_err = 0.0
+    # move along the line of sight by the range error, but only part of the way
+    cam_pos_des = los * dist_err * cfg["smoothing"]
+    return dict(position=cam_pos_des, look_at=p_debris_cam)
+
+
+# =============================================================================
+# 5.  MAIN LOOP
+# =============================================================================
+def run(traj_path, make_gif=False):
+    cfg = CFG
+    rng = np.random.default_rng(0)
+    t_all, pos_all = load_trajectory(traj_path)
+    idx = np.arange(0, len(t_all), cfg["frame_step"])
+
+    arm = SmallArm(cfg)
+    cam = SyntheticCamera(cfg, rng)
+
+    log = {k: [] for k in ["t", "base_rng", "cam_rng", "los_err_deg", "pix_err",
+                           "est_err_cm", "saturated", "lost", "det_iou"]}
+    snapshots = {}
+    snap_times = [t_all[idx[0]], t_all[idx[len(idx) // 2]], t_all[idx[-1]]]
+    gif_frames = []
+    gif_every = max(1, len(idx) // 90)
+
+    t0 = time.time()
+    for k, i in enumerate(idx):
+        t = t_all[i]
+        base = pos_all[i]                               # big arm put the chaser here
+
+        # 1. CAMERA: what does the camera see right now?
+        cam_pos, R_cam = arm.camera_pose(base)
+        rgb, depth, true_mask = cam.render(cam_pos, R_cam, t)
+
+        # 2-5. DETECT + ESTIMATE
+        mask = detect_debris(rgb, depth, cfg)
+        p_est, uv = estimate_position(mask, depth, cfg)
+
+        # ground truth, only for scoring
+        p_true = R_cam.T @ (np.zeros(3) - cam_pos)
+        los_err = np.degrees(np.arccos(np.clip(p_true[2] / np.linalg.norm(p_true), -1, 1)))
+        u_true = cfg["fx"] * p_true[0] / p_true[2] + cfg["cx"]
+        v_true = cfg["fy"] * p_true[1] / p_true[2] + cfg["cy"]
+        inter = (mask & true_mask).sum(); union = (mask | true_mask).sum()
+
+        saturated = False
+        if p_est is not None:
+            # 6. YOUR OUTPUT: setpoint in the camera optical frame
+            sp = compute_setpoint(p_est, cfg)
+
+            # 7. [Manipulator team] camera frame -> world frame, then IK
+            p_des_w = cam_pos + R_cam @ sp["position"]
+            look_w = cam_pos + R_cam @ sp["look_at"]
+            # the arm can only put the camera within its reach sphere
+            off = p_des_w - base
+            max_r = 0.97 * arm.reach
+            if np.linalg.norm(off) > max_r:
+                p_des_w = base + off / np.linalg.norm(off) * max_r
+                saturated = True
+            arm.ik_step(base, p_des_w, look_w, cfg)
+
+        # logging
+        log["t"].append(t)
+        log["base_rng"].append(np.linalg.norm(base))
+        log["cam_rng"].append(np.linalg.norm(cam_pos))
+        log["los_err_deg"].append(los_err)
+        log["pix_err"].append(np.hypot(u_true - cfg["cx"], v_true - cfg["cy"]))
+        log["est_err_cm"].append(np.nan if p_est is None else 100 * np.linalg.norm(p_est - p_true))
+        log["saturated"].append(saturated)
+        log["lost"].append(p_est is None)
+        log["det_iou"].append(inter / union if union else 0.0)
+
+        if any(abs(t - s) < 1e-9 for s in snap_times):
+            snapshots[t] = dict(rgb=rgb, depth=depth, mask=mask, uv=uv, p_est=p_est,
+                                p_true=p_true, base=base.copy(), q=arm.q.copy())
+        if make_gif and k % gif_every == 0:
+            pts, _ = arm.fk(arm.q, base)
+            gif_frames.append(dict(t=t, rgb=rgb, mask=mask, uv=uv, pts=pts))
+
+    print(f"Simulated {len(idx)} camera frames in {time.time() - t0:.1f} s")
+    log = {k: np.array(v) for k, v in log.items()}
+
+    valid = ~log["lost"]
+    print(f"  debris lost in           {log['lost'].sum()} / {len(idx)} frames")
+    print(f"  detection IoU (mean)     {np.mean(log['det_iou']):.3f}   (1.0 = perfect mask)")
+    print(f"  position estimate error  median {np.nanmedian(log['est_err_cm']):.1f} cm, "
+          f"max {np.nanmax(log['est_err_cm']):.1f} cm")
+    print(f"  line-of-sight error      median {np.median(log['los_err_deg']):.2f} deg, "
+          f"max {np.max(log['los_err_deg']):.2f} deg")
+    reach_ok = ~log["saturated"] & valid
+    if reach_ok.any():
+        derr = np.abs(log["cam_rng"][reach_ok] - cfg["desired_distance"]) * 100
+        print(f"  distance error (arm NOT at full reach)  median {np.median(derr):.1f} cm, max {np.max(derr):.1f} cm")
+    print(f"  frames where the setpoint was OUT OF REACH: {log['saturated'].sum()} "
+          f"({100 * log['saturated'].mean():.0f}%)")
+
+    plot_pipeline(snapshots, cfg)
+    plot_performance(log, cfg)
+    plot_scene(pos_all, snapshots, arm, cam, cfg)
+    if make_gif:
+        save_gif(gif_frames, pos_all, cfg)
+    plt.show()
+
+
+# =============================================================================
+# 6.  PLOTS
+# =============================================================================
+def plot_pipeline(snapshots, cfg):
+    """What the camera sees and what each pipeline step extracts."""
+    times = sorted(snapshots)
+    fig, ax = plt.subplots(len(times), 3, figsize=(13, 3.4 * len(times)))
+    for r, t in enumerate(times):
+        s = snapshots[t]
+        ax[r, 0].imshow(s["rgb"])
+        ax[r, 0].set_title(f"t = {t:.0f} s   RGB image (note the stars)")
+        d = np.ma.masked_equal(s["depth"], 0)
+        im = ax[r, 1].imshow(d, cmap="viridis")
+        ax[r, 1].set_title("Depth image (m)  -- black = no return")
+        ax[r, 1].set_facecolor("black")
+        fig.colorbar(im, ax=ax[r, 1], fraction=0.035)
+        ax[r, 2].imshow(s["mask"], cmap="gray")
+        ax[r, 2].plot(cfg["cx"], cfg["cy"], "g+", ms=16, mew=2, label="image centre (target)")
+        if s["uv"] is not None:
+            ax[r, 2].plot(*s["uv"], "rx", ms=12, mew=2, label="mask centroid (u,v)")
+            e, tr = s["p_est"], s["p_true"]
+            ax[r, 2].set_title(f"Mask + centroid\nest. range {np.linalg.norm(e):.3f} m  |  "
+                               f"true {np.linalg.norm(tr):.3f} m")
+        ax[r, 2].legend(loc="lower right", fontsize=7)
+        for a in ax[r]:
+            a.set_xticks([]); a.set_yticks([])
+    fig.suptitle("What the end-effector camera sees, and what the pipeline extracts", fontsize=13)
+    fig.tight_layout()
+    fig.savefig("fig1_camera_pipeline.png", dpi=110)
+
+
+def plot_performance(log, cfg):
+    t = log["t"]
+    fig, ax = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
+
+    sat = log["saturated"]
+    for a in ax:
+        a.fill_between(t, 0, 1, where=sat, transform=a.get_xaxis_transform(),
+                       color="orange", alpha=0.2, label="setpoint out of arm's reach")
+
+    ax[0].plot(t, log["base_rng"], "k--", label="arm BASE to debris (set by big arm)")
+    ax[0].plot(t, log["cam_rng"], "b-", lw=2, label="CAMERA to debris")
+    ax[0].axhline(cfg["desired_distance"], color="g", ls=":", lw=2, label="desired distance")
+    ax[0].set_ylabel("distance (m)")
+    ax[0].set_title("Distance hold: the small arm can only compensate within its reach")
+    ax[0].legend(fontsize=8, loc="upper right")
+
+    ax[1].plot(t, log["los_err_deg"], "r-")
+    ax[1].set_ylabel("LOS error (deg)")
+    ax[1].set_title("Centring: angle between the optical axis and the true debris direction")
+
+    ax[2].plot(t, log["est_err_cm"], "m-")
+    ax[2].set_ylabel("error (cm)")
+    ax[2].set_xlabel("time (s)")
+    ax[2].set_title("Perception accuracy: |estimated - true| debris position")
+    fig.tight_layout()
+    fig.savefig("fig2_tracking_performance.png", dpi=110)
+
+
+def draw_box(ax, R, h, **kw):
+    corners = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]) * h
+    c = corners @ R.T
+    for i in range(8):
+        for j in range(i + 1, 8):
+            if np.sum(np.abs(np.array([(i >> 2) & 1, (i >> 1) & 1, i & 1]) -
+                             np.array([(j >> 2) & 1, (j >> 1) & 1, j & 1]))) == 1:
+                ax.plot(*zip(c[i], c[j]), **kw)
+
+
+def plot_scene(pos_all, snapshots, arm, cam, cfg):
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(pos_all[:, 0], pos_all[:, 1], pos_all[:, 2], "k--", lw=1,
+            label="chaser path (arm base, carried by big arm)")
+    draw_box(ax, cam.debris_rotation(0), cfg["debris_half"], color="goldenrod", lw=2)
+    for t, s in sorted(snapshots.items()):
+        pts, R = arm.fk(s["q"], s["base"])
+        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], "-o", ms=3, lw=2.5)
+        ax.plot(*zip(pts[-1], np.zeros(3)), "c:", lw=1)      # line of sight
+        ax.text(*pts[0], f" t={t:.0f}s", fontsize=8)
+    ax.set_xlabel("x radial (m)"); ax.set_ylabel("y along-track (m)"); ax.set_zlabel("z (m)")
+    ax.set_xlim(-0.8, 0.8); ax.set_ylim(-1.6, 0.1); ax.set_zlim(-0.4, 0.4)
+    ax.view_init(elev=30, azim=-60)
+    ax.set_title("Small arm on the moving chaser, keeping LOS to the debris\n(dotted = line of sight)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig("fig3_scene_3d.png", dpi=110)
+
+
+def save_gif(frames, pos_all, cfg):
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.4))
+
+    def draw(k):
+        f = frames[k]
+        a1.clear(); a2.clear()
+        a1.imshow(f["rgb"])
+        a1.contour(f["mask"], levels=[0.5], colors="cyan", linewidths=0.8)
+        a1.plot(cfg["cx"], cfg["cy"], "g+", ms=14, mew=2)
+        if f["uv"] is not None:
+            a1.plot(*f["uv"], "rx", ms=10, mew=2)
+        a1.set_title(f"camera view  t={f['t']:.0f}s  (+ target, x detected)")
+        a1.set_xticks([]); a1.set_yticks([])
+        a2.plot(pos_all[:, 0], pos_all[:, 1], "k--", lw=1)
+        a2.plot(0, 0, "*", color="goldenrod", ms=18)
+        p = f["pts"]
+        a2.plot(p[:, 0], p[:, 1], "b-o", ms=3, lw=2)
+        a2.plot([p[-1, 0], 0], [p[-1, 1], 0], "c:")
+        a2.set_xlim(-0.7, 0.7); a2.set_ylim(-1.6, 0.2); a2.set_aspect("equal")
+        a2.set_xlabel("x radial (m)"); a2.set_ylabel("y along-track (m)")
+        a2.set_title("top view: arm base rides the approach path")
+
+    anim = animation.FuncAnimation(fig, draw, frames=len(frames))
+    anim.save("tracking_demo.gif", writer=animation.PillowWriter(fps=10))
+    plt.close(fig)
+    print("Saved tracking_demo.gif")
+
+
+if __name__ == "__main__":
+    path = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") \
+        else "trajectory_orbit_lvlh.xlsx"
+    run(path, make_gif="--gif" in sys.argv)
