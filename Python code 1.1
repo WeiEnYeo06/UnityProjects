@@ -1,0 +1,598 @@
+"""
+debris_tracking_v2.py
+=====================
+
+Mission (as clarified by the team)
+----------------------------------
+* The BIG testbed manipulator plays the chaser satellite. Its end effector
+  follows the given approach trajectory: 1.5 m -> 0.3 m from the debris.
+* Once the 30 cm threshold is reached, the chaser HOLDS its position.
+* The debris is fixed in position (it may still tumble in place).
+* The SMALL manipulator is mounted on the big arm's end effector, so its base
+  moves with the chaser. A depth camera is at its end effector.
+* Goal: the camera keeps the debris CENTRED in the image at all times, and
+  keeps the camera-to-debris DISTANCE constant.
+
+What changed from debris_tracking_demo.py, and why
+--------------------------------------------------
+1. TWO PHASES. After the trajectory ends, a HOLD phase is appended in which
+   the chaser stays at the threshold.
+
+2. CHASER DISTURBANCE. A perfectly still chaser would make "hold the
+   distance" trivial. In reality the big arm has tracking error (and a real
+   chaser drifts during station keeping), so the chaser position wobbles by a
+   few cm. The small arm must cancel that. This is the part of the task that
+   actually needs the camera loop.
+
+3. WHEN THE DISTANCE CAN BE HELD. The chaser closes 1.2 m, but the small arm
+   can only move the camera by its own reach (0.36 m). So the camera distance
+   CANNOT be constant for the whole approach -- no controller can fix that.
+   The distance command therefore works like this:
+     * early approach: the arm sits in a relaxed "ready" pose (not fully
+       stretched, so it keeps room to react) and only keeps the debris centred;
+       the distance shrinks naturally as the chaser approaches;
+     * "capture": as soon as the hold distance becomes reachable, the command
+       locks onto it, and from then on (rest of approach + whole hold phase)
+       the camera holds that distance.
+
+4. DEBRIS AND CAMERA SIZED FOR A 30 cm THRESHOLD.
+     * Debris = 10 cm cube (1U CubeSat replica). A 20 x 20 x 30 cm box would
+       almost touch the chaser at 30 cm.
+     * Camera = short-range depth camera (like the RealSense D405: roughly
+       7-50 cm ideal range, ~87 x 58 deg field of view). A D435 cannot measure
+       much closer than ~0.2-0.3 m, so it would go blind near the threshold.
+
+5. REQUIREMENT CHECKS. At the end the script prints PASS / FAIL against
+   tolerances you set (distance error, pointing error, debris kept fully in
+   view, no arm-debris contact).
+
+Everything is set in CFG below.
+
+Run
+---
+    conda activate debris
+    python debris_tracking_v2.py trajectory_orbit_lvlh.xlsx
+    python debris_tracking_v2.py trajectory_orbit_lvlh.xlsx --gif
+
+Frames (agree these with the Manipulator team)
+----------------------------------------------
+* World: debris-centred LVLH, metres. x radial, y along-track, z cross-track.
+* Camera optical frame (OpenCV / ROS): +z forward, +x image right, +y image down.
+"""
+
+import sys
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib import animation
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+CFG = dict(
+    # --- mission timeline ---
+    frame_step=2,              # every Nth row of the 0.1 s trajectory -> 5 Hz camera
+    hold_duration=180.0,       # seconds of hold at the threshold after the approach
+
+    # --- chaser disturbance (big-arm tracking error / station-keeping drift) ---
+    disturbance_amp=np.array([0.02, 0.02, 0.015]),   # slow wobble amplitude per axis (m)
+    disturbance_period=np.array([37.0, 23.0, 29.0]), # seconds
+    disturbance_noise=0.001,   # fast jitter, 1 sigma (m)
+    disturb_during_approach=True,
+
+    # --- camera (short-range RGB-D, roughly a RealSense D405, downscaled) ---
+    img_w=320, img_h=180,
+    fx=168.0, fy=168.0,        # -> ~87 x 56 deg field of view
+    cx=159.5, cy=89.5,
+    depth_min=0.07,
+    depth_max=1.6,
+    depth_noise_a=0.0005,      # sigma = a + b * Z^2
+    depth_noise_b=0.010,
+    depth_dropout=0.03,
+    rgb_noise=0.02,
+    num_stars=400,
+
+    # --- debris: 1U CubeSat replica ---
+    debris_half=np.array([0.05, 0.05, 0.05]),
+    debris_spin_deg_s=0.0,     # the brief says the debris is FIXED. Set e.g. 1.5 to stress-test
+                               # with a tumbling target (perception errors grow at close range)
+    debris_spin_axis=np.array([0.3, 0.2, 1.0]),
+    sun_dir=np.array([-0.6, -0.6, 0.5]),
+
+    # --- detection / estimation ---
+    det_min_brightness=0.04,
+    det_max_range=1.6,
+    det_min_pixels=20,
+    centre_offset=0.05,        # median depth hits the SURFACE; add half the debris size to reach the centre
+
+    # --- distance-hold controller (YOUR design choices) ---
+    hold_distance=0.20,        # camera-to-debris-centre distance to hold (m)
+    ready_extension=0.70,      # before capture, arm sits at this fraction of its reach
+    smoothing=0.5,             # fraction of the way to the setpoint per frame
+    deadband_dist=0.002,       # ignore range errors below this (m)
+
+    # --- small arm (stand-in for the Manipulator team) ---
+    num_links=6,
+    link_len=0.06,             # total reach 0.36 m
+    q_init=np.array([0.0, 0.9, 0.0, -1.8, 0.0, 0.9]),  # bent "ready" pose, not straight
+    ik_iters=15,
+    ik_damping=0.05,
+    ik_rot_weight=0.3,
+
+    # --- requirements to check at the end ---
+    # PLACEHOLDERS: your team must decide the real tolerances (the brief only gives
+    # the 30 cm chaser threshold and "< 10 cm" for the on-board arm).
+    req_distance_tol=0.010,    # |camera distance - command| after capture (m)
+    req_los_deg=3.0,           # pointing error, whole mission (deg)
+    req_min_clearance=0.02,    # arm must stay this far outside the debris (m)
+)
+
+
+# =============================================================================
+# 1.  MISSION TIMELINE: approach trajectory + hold phase + disturbance
+# =============================================================================
+def load_trajectory(path):
+    df = pd.read_excel(path) if path.lower().endswith((".xlsx", ".xls")) else pd.read_csv(path)
+    arr = df.iloc[:, :4].to_numpy(dtype=float)
+    return arr[:, 0], arr[:, 1:4]
+
+
+def build_mission(path, cfg, rng):
+    t_tr, p_tr = load_trajectory(path)
+    dt = t_tr[1] - t_tr[0]
+    n_hold = int(round(cfg["hold_duration"] / dt))
+    t_hold = t_tr[-1] + dt * np.arange(1, n_hold + 1)
+    p_hold = np.repeat(p_tr[-1][None, :], n_hold, axis=0)
+
+    t = np.concatenate([t_tr, t_hold])
+    p_nominal = np.vstack([p_tr, p_hold])
+    phase = np.concatenate([np.zeros(len(t_tr), int), np.ones(n_hold, int)])  # 0 approach, 1 hold
+
+    phases0 = rng.uniform(0, 2 * np.pi, 3)
+    wobble = cfg["disturbance_amp"] * np.sin(2 * np.pi * t[:, None] / cfg["disturbance_period"] + phases0)
+    jitter = rng.normal(0, cfg["disturbance_noise"], size=(len(t), 3))
+    dist = wobble + jitter
+    if not cfg["disturb_during_approach"]:
+        dist[phase == 0] = 0.0
+    return t, p_nominal, p_nominal + dist, phase
+
+
+# =============================================================================
+# 2.  SMALL ARM (stand-in for the Manipulator team)
+# =============================================================================
+def rot(axis, theta):
+    axis = axis / np.linalg.norm(axis)
+    x, y, z = axis
+    c, s, C = np.cos(theta), np.sin(theta), 1 - np.cos(theta)
+    return np.array([[x*x*C + c,   x*y*C - z*s, x*z*C + y*s],
+                     [y*x*C + z*s, y*y*C + c,   y*z*C - x*s],
+                     [z*x*C - y*s, z*y*C + x*s, z*z*C + c]])
+
+
+class SmallArm:
+    def __init__(self, cfg):
+        self.n = cfg["num_links"]
+        self.L = np.full(self.n, cfg["link_len"])
+        self.reach = self.L.sum()
+        self.axes = [np.array([0, 0, 1.0]) if i % 2 == 0 else np.array([0, 1.0, 0])
+                     for i in range(self.n)]
+        self.R_base = rot(np.array([0, 0, 1.0]), np.pi / 2)   # local x -> world +y (toward debris)
+        self.q = cfg["q_init"].astype(float).copy()
+
+    def fk(self, q, base_pos):
+        R = self.R_base.copy()
+        p = base_pos.copy()
+        pts = [p.copy()]
+        for i in range(self.n):
+            R = R @ rot(self.axes[i], q[i])
+            p = p + R @ np.array([self.L[i], 0, 0])
+            pts.append(p.copy())
+        return np.array(pts), R
+
+    @staticmethod
+    def camera_rotation(R_ee):
+        # optical z = link x, optical x = -link y, optical y = -link z
+        return np.column_stack([-R_ee[:, 1], -R_ee[:, 2], R_ee[:, 0]])
+
+    def camera_pose(self, base_pos):
+        pts, R = self.fk(self.q, base_pos)
+        return pts[-1], self.camera_rotation(R)
+
+    def ik_step(self, base_pos, p_des, look_at, cfg):
+        w, lam2 = cfg["ik_rot_weight"], cfg["ik_damping"] ** 2
+        q = self.q.copy()
+
+        def err(qq):
+            pts, R = self.fk(qq, base_pos)
+            z_des = look_at - pts[-1]
+            z_des /= (np.linalg.norm(z_des) + 1e-12)
+            return np.concatenate([p_des - pts[-1], np.cross(R[:, 0], z_des) * w])
+
+        for _ in range(cfg["ik_iters"]):
+            e = err(q)
+            if np.linalg.norm(e) < 1e-4:
+                break
+            J = np.zeros((6, self.n))
+            for j in range(self.n):
+                dq = np.zeros(self.n); dq[j] = 1e-5
+                J[:, j] = -(err(q + dq) - e) / 1e-5
+            step = J.T @ np.linalg.solve(J @ J.T + lam2 * np.eye(6), e)
+            q = np.clip(q + np.clip(step, -0.2, 0.2), -np.pi, np.pi)
+        self.q = q
+
+
+# =============================================================================
+# 3.  SYNTHETIC RGB-D CAMERA (stand-in for the RealSense / Unity renderer)
+# =============================================================================
+class SyntheticCamera:
+    FACE_COLOURS = np.array([
+        [0.85, 0.65, 0.20], [0.85, 0.65, 0.20],   # +/-x gold foil
+        [0.55, 0.55, 0.60], [0.55, 0.55, 0.60],   # +/-y grey structure
+        [0.15, 0.25, 0.55], [0.15, 0.25, 0.55],   # +/-z blue solar cells
+    ])
+
+    def __init__(self, cfg, rng):
+        self.cfg, self.rng = cfg, rng
+        W, H = cfg["img_w"], cfg["img_h"]
+        u, v = np.meshgrid(np.arange(W), np.arange(H))
+        self.rays_cam = np.stack([(u - cfg["cx"]) / cfg["fx"], (v - cfg["cy"]) / cfg["fy"],
+                                  np.ones_like(u, dtype=float)], axis=-1).reshape(-1, 3)
+        s = rng.normal(size=(cfg["num_stars"], 3))
+        self.stars = s / np.linalg.norm(s, axis=1, keepdims=True)
+        self.sun = cfg["sun_dir"] / np.linalg.norm(cfg["sun_dir"])
+
+    def debris_rotation(self, t):
+        return rot(self.cfg["debris_spin_axis"], np.deg2rad(self.cfg["debris_spin_deg_s"]) * t)
+
+    def render(self, cam_pos, R_cam, t):
+        cfg = self.cfg
+        H, W = cfg["img_h"], cfg["img_w"]
+        h = cfg["debris_half"]
+        R_deb = self.debris_rotation(t)
+
+        d_world = self.rays_cam @ R_cam.T
+        o_b = R_deb.T @ cam_pos
+        d_b = d_world @ R_deb
+        d_b = np.where(np.abs(d_b) < 1e-12, 1e-12, d_b)
+        t1, t2 = (-h - o_b) / d_b, (h - o_b) / d_b
+        t_lo, t_hi = np.minimum(t1, t2), np.maximum(t1, t2)
+        t_near, t_far = t_lo.max(axis=1), t_hi.min(axis=1)
+        axis_hit = t_lo.argmax(axis=1)
+        hit = (t_far >= t_near) & (t_near > 0)
+
+        rows = np.arange(len(d_b))
+        n_b = np.zeros_like(d_b)
+        n_b[rows, axis_hit] = -np.sign(d_b[rows, axis_hit])
+        lambert = np.clip((n_b @ R_deb.T) @ self.sun, 0, 1)
+        face = axis_hit * 2 + (n_b[rows, axis_hit] > 0)
+        colour = self.FACE_COLOURS[face] * (0.12 + 0.88 * lambert)[:, None]
+
+        rgb = np.zeros((H * W, 3)); rgb[hit] = colour[hit]
+        depth = np.zeros(H * W); depth[hit] = t_near[hit]
+        true_mask = hit.reshape(H, W)
+        rgb, depth = rgb.reshape(H, W, 3), depth.reshape(H, W)
+
+        s_cam = self.stars @ R_cam
+        front = s_cam[:, 2] > 0.1
+        su = np.round(cfg["fx"] * s_cam[front, 0] / s_cam[front, 2] + cfg["cx"]).astype(int)
+        sv = np.round(cfg["fy"] * s_cam[front, 1] / s_cam[front, 2] + cfg["cy"]).astype(int)
+        ok = (su >= 0) & (su < W) & (sv >= 0) & (sv < H)
+        su, sv = su[ok], sv[ok]
+        vis = ~true_mask[sv, su]
+        rgb[sv[vis], su[vis]] = 0.9
+
+        rgb = np.clip(rgb + self.rng.normal(0, cfg["rgb_noise"], rgb.shape), 0, 1)
+        valid = depth > 0
+        sigma = cfg["depth_noise_a"] + cfg["depth_noise_b"] * depth ** 2
+        depth = np.where(valid, depth + self.rng.normal(size=depth.shape) * sigma, 0.0)
+        depth[self.rng.random(depth.shape) < cfg["depth_dropout"]] = 0.0
+        depth[(depth < cfg["depth_min"]) | (depth > cfg["depth_max"])] = 0.0
+        return rgb, depth, true_mask
+
+
+# =============================================================================
+# 4.  YOUR PIPELINE: detect -> estimate -> setpoint
+# =============================================================================
+def detect_debris(rgb, depth, cfg):
+    """Pixels that are bright AND have a valid, close depth.
+    Replace with YOLO-seg / Mask R-CNN / SAM for the real lab scene."""
+    has_depth = (depth > 0) & (depth < cfg["det_max_range"])
+    return has_depth & (rgb.mean(axis=2) > cfg["det_min_brightness"])
+
+
+def estimate_position(mask, depth, cfg):
+    vs, us = np.nonzero(mask)
+    if len(us) < cfg["det_min_pixels"]:
+        return None, None
+    u_c, v_c = us.mean(), vs.mean()
+    Z = np.median(depth[vs, us]) + cfg["centre_offset"]
+    return np.array([(u_c - cfg["cx"]) * Z / cfg["fx"], (v_c - cfg["cy"]) * Z / cfg["fy"], Z]), (u_c, v_c)
+
+
+def distance_command(chaser_range, arm_reach, cfg):
+    """How far from the debris the camera SHOULD be right now.
+    Before capture: whatever a relaxed 'ready' arm pose gives (the hold
+    distance is out of reach). After capture: the fixed hold distance."""
+    d_ready = chaser_range - cfg["ready_extension"] * arm_reach
+    return max(cfg["hold_distance"], d_ready)
+
+
+def compute_setpoint(p_debris_cam, d_cmd, cfg):
+    """YOUR TEAM'S OUTPUT, in the camera optical frame: new camera position
+    (along the line of sight, at d_cmd from the debris) + look-at point."""
+    rng = np.linalg.norm(p_debris_cam)
+    los = p_debris_cam / rng
+    err = rng - d_cmd
+    if abs(err) < cfg["deadband_dist"]:
+        err = 0.0
+    return dict(position=los * err * cfg["smoothing"], look_at=p_debris_cam)
+
+
+# =============================================================================
+# 5.  MAIN LOOP
+# =============================================================================
+def arm_clearance(pts, cfg, samples=6):
+    """Smallest distance from any point on the arm to the debris'
+    bounding sphere (positive = safe)."""
+    r_deb = np.linalg.norm(cfg["debris_half"])
+    seg = [pts[i] + a * (pts[i + 1] - pts[i]) for i in range(len(pts) - 1)
+           for a in np.linspace(0, 1, samples)]
+    return np.min(np.linalg.norm(np.array(seg), axis=1)) - r_deb
+
+
+def run(traj_path, make_gif=False):
+    cfg = CFG
+    rng = np.random.default_rng(0)
+    t_all, p_nom, p_act, phase = build_mission(traj_path, cfg, rng)
+    idx = np.arange(0, len(t_all), cfg["frame_step"])
+
+    arm = SmallArm(cfg)
+    cam = SyntheticCamera(cfg, rng)
+
+    keys = ["t", "phase", "chaser_nom", "chaser_act", "cam_rng", "d_cmd", "captured",
+            "los_err_deg", "est_err_cm", "lost", "edge", "saturated", "clearance"]
+    log = {k: [] for k in keys}
+    snaps = {}
+    t_end_approach = t_all[phase == 0][-1]
+    gif_frames, gif_every = [], max(1, len(idx) // 110)
+    capture_t = None
+
+    t0 = time.time()
+    for k, i in enumerate(idx):
+        t, base = t_all[i], p_act[i]
+
+        cam_pos, R_cam = arm.camera_pose(base)
+        rgb, depth, true_mask = cam.render(cam_pos, R_cam, t)
+        mask = detect_debris(rgb, depth, cfg)
+        p_est, uv = estimate_position(mask, depth, cfg)
+
+        # distance command uses the NOMINAL chaser range (known from the testbed)
+        d_cmd = distance_command(np.linalg.norm(p_nom[i]), arm.reach, cfg)
+        captured = d_cmd <= cfg["hold_distance"] + 1e-9
+        if captured and capture_t is None:
+            capture_t = t
+
+        saturated = False
+        if p_est is not None:
+            sp = compute_setpoint(p_est, d_cmd, cfg)
+            # [Manipulator team] camera frame -> world, reach limit, IK
+            p_des = cam_pos + R_cam @ sp["position"]
+            look = cam_pos + R_cam @ sp["look_at"]
+            off = p_des - base
+            if np.linalg.norm(off) > 0.97 * arm.reach:
+                p_des = base + off / np.linalg.norm(off) * 0.97 * arm.reach
+                saturated = True
+            arm.ik_step(base, p_des, look, cfg)
+
+        p_true = R_cam.T @ (-cam_pos)
+        pts, _ = arm.fk(arm.q, base)
+        m = mask
+        log["t"].append(t); log["phase"].append(phase[i])
+        log["chaser_nom"].append(np.linalg.norm(p_nom[i]))
+        log["chaser_act"].append(np.linalg.norm(base))
+        log["cam_rng"].append(np.linalg.norm(cam_pos))
+        log["d_cmd"].append(d_cmd); log["captured"].append(captured)
+        log["los_err_deg"].append(np.degrees(np.arccos(np.clip(p_true[2] / np.linalg.norm(p_true), -1, 1))))
+        log["est_err_cm"].append(np.nan if p_est is None else 100 * np.linalg.norm(p_est - p_true))
+        log["lost"].append(p_est is None)
+        log["edge"].append(bool(true_mask[0].any() | true_mask[-1].any() | true_mask[:, 0].any() | true_mask[:, -1].any()))
+        log["saturated"].append(saturated)
+        log["clearance"].append(arm_clearance(pts, cfg))
+
+        want = {"start": k == 0,
+                "capture": capture_t is not None and abs(t - capture_t) < 1e-9,
+                "threshold reached": abs(t - t_end_approach) < 1e-9 or
+                                     (t > t_end_approach and "threshold reached" not in snaps),
+                "hold": t >= t_end_approach + cfg["hold_duration"] / 2 and "hold" not in snaps}
+        for name, flag in want.items():
+            if flag and name not in snaps:
+                snaps[name] = dict(t=t, rgb=rgb, depth=depth, mask=m, uv=uv, p_est=p_est,
+                                   p_true=p_true, base=base.copy(), q=arm.q.copy())
+        if make_gif and k % gif_every == 0:
+            gif_frames.append(dict(t=t, phase=phase[i], rgb=rgb, mask=m, uv=uv, pts=pts,
+                                   cam_rng=np.linalg.norm(cam_pos), d_cmd=d_cmd))
+
+    print(f"Simulated {len(idx)} frames ({t_all[idx[-1]]:.0f} s of mission) in {time.time() - t0:.1f} s")
+    log = {k: np.array(v) for k, v in log.items()}
+    log["capture_t"] = capture_t
+    report(log, cfg)
+
+    plot_pipeline(snaps, cfg)
+    plot_performance(log, cfg)
+    plot_scene(p_nom, p_act, phase, snaps, arm, cam, cfg)
+    if make_gif:
+        save_gif(gif_frames, p_nom, cfg)
+    plt.show()
+
+
+def report(log, cfg):
+    cap = log["captured"]
+    dist_err = np.abs(log["cam_rng"] - log["d_cmd"])
+    hold = log["phase"] == 1
+    print(f"\nDistance becomes holdable ('capture') at t = {log['capture_t']:.0f} s "
+          f"(chaser {log['chaser_nom'][cap][0]:.2f} m from debris)")
+
+    def line(name, value, ok):
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:<48} {value}")
+
+    print("\nRequirement checks")
+    e_cap = dist_err[cap] * 1000
+    line(f"distance held within {cfg['req_distance_tol']*100:.1f} cm after capture",
+         f"median {np.median(e_cap):.1f} mm, max {e_cap.max():.1f} mm", e_cap.max() <= cfg["req_distance_tol"] * 1000)
+    e_hold = dist_err[hold] * 1000
+    print(f"        (hold phase only: median {np.median(e_hold):.1f} mm, max {e_hold.max():.1f} mm, "
+          f"while the chaser itself moved {100*np.ptp(log['chaser_act'][hold]):.1f} cm)")
+    line(f"debris centred within {cfg['req_los_deg']:.1f} deg, whole mission",
+         f"median {np.median(log['los_err_deg']):.2f} deg, max {log['los_err_deg'].max():.2f} deg",
+         log["los_err_deg"].max() <= cfg["req_los_deg"])
+    line("debris detected in every frame", f"lost in {log['lost'].sum()} frames", log["lost"].sum() == 0)
+    line("debris fully inside the image", f"touches image edge in {log['edge'].sum()} frames",
+         log["edge"].sum() == 0)
+    line(f"arm stays >= {cfg['req_min_clearance']*100:.0f} cm from debris",
+         f"min clearance {100*log['clearance'].min():.1f} cm", log["clearance"].min() >= cfg["req_min_clearance"])
+    line("arm never at full reach", f"{log['saturated'].sum()} frames saturated", log["saturated"].sum() == 0)
+    print(f"  info  perception error: median {np.nanmedian(log['est_err_cm']):.2f} cm, "
+          f"max {np.nanmax(log['est_err_cm']):.2f} cm")
+
+
+# =============================================================================
+# 6.  PLOTS
+# =============================================================================
+def shade_phases(ax, log):
+    hold = log["phase"] == 1
+    ax.fill_between(log["t"], 0, 1, where=hold, transform=ax.get_xaxis_transform(),
+                    color="tab:blue", alpha=0.08, label="hold phase")
+    if log["capture_t"] is not None:
+        ax.axvline(log["capture_t"], color="g", ls="--", lw=1, label="capture")
+
+
+def plot_pipeline(snaps, cfg):
+    order = [k for k in ["start", "capture", "threshold reached", "hold"] if k in snaps]
+    fig, ax = plt.subplots(len(order), 3, figsize=(13, 2.9 * len(order)))
+    for r, name in enumerate(order):
+        s = snaps[name]
+        ax[r, 0].imshow(s["rgb"]); ax[r, 0].set_title(f"{name}  (t = {s['t']:.0f} s)   RGB")
+        im = ax[r, 1].imshow(np.ma.masked_equal(s["depth"], 0), cmap="viridis")
+        ax[r, 1].set_facecolor("black"); ax[r, 1].set_title("depth (m)")
+        fig.colorbar(im, ax=ax[r, 1], fraction=0.03)
+        ax[r, 2].imshow(s["mask"], cmap="gray")
+        ax[r, 2].plot(cfg["cx"], cfg["cy"], "g+", ms=14, mew=2)
+        if s["uv"] is not None:
+            ax[r, 2].plot(*s["uv"], "rx", ms=10, mew=2)
+            ax[r, 2].set_title(f"mask   est {np.linalg.norm(s['p_est']):.3f} m | "
+                               f"true {np.linalg.norm(s['p_true']):.3f} m")
+        for a in ax[r]:
+            a.set_xticks([]); a.set_yticks([])
+    fig.suptitle("Camera view at key moments  (green + = image centre, red x = detected centroid)")
+    fig.tight_layout()
+    fig.savefig("v2_fig1_camera_views.png", dpi=110)
+
+
+def plot_performance(log, cfg):
+    t = log["t"]
+    fig, ax = plt.subplots(4, 1, figsize=(11, 11), sharex=True)
+    for a in ax:
+        shade_phases(a, log)
+
+    ax[0].plot(t, log["chaser_act"], "k-", lw=0.8, label="chaser (big arm) to debris")
+    ax[0].plot(t, log["cam_rng"], "b-", lw=2, label="camera to debris")
+    ax[0].plot(t, log["d_cmd"], "g:", lw=2, label="distance command")
+    ax[0].set_ylabel("distance (m)"); ax[0].legend(fontsize=8, loc="upper right")
+    ax[0].set_title("Distances: camera locks to the hold distance once it is reachable")
+
+    cap = log["captured"]
+    err_mm = (log["cam_rng"] - log["d_cmd"]) * 1000
+    ax[1].plot(t[cap], err_mm[cap], "b-", lw=1)
+    ax[1].axhspan(-cfg["req_distance_tol"] * 1000, cfg["req_distance_tol"] * 1000, color="g", alpha=0.1,
+                  label="tolerance")
+    ax[1].set_ylabel("error (mm)"); ax[1].legend(fontsize=8, loc="upper right")
+    ax[1].set_title("Distance-hold error after capture (camera distance - command)")
+
+    ax[2].plot(t, log["los_err_deg"], "r-", lw=1)
+    ax[2].axhline(cfg["req_los_deg"], color="r", ls=":", lw=1)
+    ax[2].set_ylabel("LOS error (deg)")
+    ax[2].set_title("Centring: angle between optical axis and true debris direction")
+
+    ax[3].plot(t, log["est_err_cm"], "m-", lw=1)
+    ax[3].set_ylabel("error (cm)"); ax[3].set_xlabel("time (s)")
+    ax[3].set_title("Perception: |estimated - true| debris position")
+    fig.tight_layout()
+    fig.savefig("v2_fig2_performance.png", dpi=110)
+
+
+def draw_box(ax, R, h, **kw):
+    corners = np.array([[a, b, c] for a in (-1, 1) for b in (-1, 1) for c in (-1, 1)]) * h @ R.T
+    for i in range(8):
+        for j in range(i + 1, 8):
+            if bin(i ^ j).count("1") == 1:
+                ax.plot(*zip(corners[i], corners[j]), **kw)
+
+
+def plot_scene(p_nom, p_act, phase, snaps, arm, cam, cfg):
+    fig = plt.figure(figsize=(13, 6))
+    ax = fig.add_subplot(121, projection="3d")
+    ax.plot(p_nom[:, 0], p_nom[:, 1], p_nom[:, 2], "k--", lw=1, label="nominal chaser path")
+    draw_box(ax, cam.debris_rotation(0), cfg["debris_half"], color="goldenrod", lw=2)
+    for name, s in snaps.items():
+        pts, _ = arm.fk(s["q"], s["base"])
+        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], "-o", ms=3, lw=2.5, label=name)
+        ax.plot(*zip(pts[-1], np.zeros(3)), "c:", lw=1)
+    ax.set_xlim(-0.6, 0.6); ax.set_ylim(-1.6, 0.1); ax.set_zlim(-0.3, 0.3)
+    ax.set_xlabel("x radial (m)"); ax.set_ylabel("y along-track (m)"); ax.set_zlabel("z (m)")
+    ax.view_init(elev=28, azim=-60); ax.legend(fontsize=7)
+    ax.set_title("Whole mission")
+
+    ax2 = fig.add_subplot(122)
+    hold = phase == 1
+    ax2.plot(p_act[hold, 0], p_act[hold, 1], "k-", lw=0.6, alpha=0.6, label="chaser wobble during hold")
+    for name in ["threshold reached", "hold"]:
+        if name in snaps:
+            s = snaps[name]
+            pts, _ = arm.fk(s["q"], s["base"])
+            ax2.plot(pts[:, 0], pts[:, 1], "-o", ms=3, lw=2.5, label=f"arm at {name}")
+    ax2.add_patch(plt.Circle((0, 0), cfg["hold_distance"], fill=False, ls=":", color="g",
+                             label="hold distance"))
+    ax2.add_patch(plt.Rectangle((-0.05, -0.05), 0.1, 0.1, color="goldenrod", alpha=0.6, label="debris"))
+    ax2.set_aspect("equal"); ax2.set_xlim(-0.25, 0.25); ax2.set_ylim(-0.4, 0.1)
+    ax2.set_xlabel("x radial (m)"); ax2.set_ylabel("y along-track (m)")
+    ax2.set_title("Top view of the hold: base wobbles, camera stays on the circle")
+    ax2.legend(fontsize=7, loc="upper left")
+    fig.tight_layout()
+    fig.savefig("v2_fig3_scene.png", dpi=110)
+
+
+def save_gif(frames, p_nom, cfg):
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.2))
+
+    def draw(k):
+        f = frames[k]
+        a1.clear(); a2.clear()
+        a1.imshow(f["rgb"])
+        a1.contour(f["mask"], levels=[0.5], colors="cyan", linewidths=0.8)
+        a1.plot(cfg["cx"], cfg["cy"], "g+", ms=14, mew=2)
+        if f["uv"] is not None:
+            a1.plot(*f["uv"], "rx", ms=10, mew=2)
+        a1.set_title(f"{'HOLD' if f['phase'] else 'APPROACH'}  t={f['t']:.0f}s   "
+                     f"cam dist {f['cam_rng']:.3f} m (cmd {f['d_cmd']:.3f})")
+        a1.set_xticks([]); a1.set_yticks([])
+        a2.plot(p_nom[:, 0], p_nom[:, 1], "k--", lw=1)
+        a2.add_patch(plt.Rectangle((-0.05, -0.05), 0.1, 0.1, color="goldenrod"))
+        a2.add_patch(plt.Circle((0, 0), cfg["hold_distance"], fill=False, ls=":", color="g"))
+        p = f["pts"]
+        a2.plot(p[:, 0], p[:, 1], "b-o", ms=3, lw=2)
+        a2.plot([p[-1, 0], 0], [p[-1, 1], 0], "c:")
+        a2.set_xlim(-0.6, 0.6); a2.set_ylim(-1.6, 0.2); a2.set_aspect("equal")
+        a2.set_title("top view")
+
+    anim = animation.FuncAnimation(fig, draw, frames=len(frames))
+    anim.save("v2_tracking.gif", writer=animation.PillowWriter(fps=10))
+    plt.close(fig)
+    print("Saved v2_tracking.gif")
+
+
+if __name__ == "__main__":
+    path = next((a for a in sys.argv[1:] if not a.startswith("--")), "trajectory_orbit_lvlh.xlsx")
+    run(path, make_gif="--gif" in sys.argv)
+
